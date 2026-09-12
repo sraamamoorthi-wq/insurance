@@ -14,7 +14,4 @@ entities:
     title: claim_policy_ui
     query_warehouse: AGENT_WH
     compute_pool: SYSTEM_COMPUTE_POOL_CPU
-    run_mode: SpcsOnly
-    execute_as: OWNER
-    artifact_repositories:
-      - SNOWFLAKE.SNOWPARK.PYPI_SHARED_REPOSITORY
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11

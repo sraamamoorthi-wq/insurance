@@ -642,3 +642,219 @@ BEGIN
     RETURN 'Processed ' || :processed_count::VARCHAR || ' documents';
 END;
 $$;
+
+-- ============================================================================
+-- UNDERWRITING PIPELINE: 3-step application assessment
+-- ============================================================================
+
+-- Step 1: Risk scoring based on applicant data + actuarial tables
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_RISK_SCORE(app_id VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_tier VARCHAR;
+    base_rate FLOAT;
+    risk_multiplier FLOAT;
+    geo_factor FLOAT;
+    history_factor FLOAT;
+    credit_adj FLOAT;
+    final_score FLOAT;
+    rec_premium FLOAT;
+BEGIN
+    LET app VARIANT := (
+        SELECT OBJECT_CONSTRUCT(
+            'application_id', application_id,
+            'lob_type', lob_type,
+            'coverage_requested', coverage_requested,
+            'credit_score', credit_score,
+            'geographic_zone', geographic_zone,
+            'existing_customer_id', existing_customer_id
+        )
+        FROM INSURANCE_DB.RAW.APPLICATIONS
+        WHERE application_id = :app_id
+    );
+
+    IF (:app IS NULL) THEN
+        RETURN OBJECT_CONSTRUCT('status', 'ERROR', 'error', 'Application not found');
+    END IF;
+
+    -- Credit score -> risk tier
+    LET credit INT := :app:credit_score::INT;
+    IF (:credit >= 750) THEN
+        risk_tier := 'LOW';
+    ELSEIF (:credit >= 650) THEN
+        risk_tier := 'MEDIUM';
+    ELSE
+        risk_tier := 'HIGH';
+    END IF;
+
+    -- Lookup actuarial rates
+    SELECT base_rate, risk_multiplier, geographic_factor, claims_history_factor
+    INTO :base_rate, :risk_multiplier, :geo_factor, :history_factor
+    FROM INSURANCE_DB.RAW.ACTUARIAL_TABLES
+    WHERE lob_type = :app:lob_type::VARCHAR
+      AND risk_tier = :risk_tier
+      AND geographic_zone LIKE '%' || LEFT(:app:geographic_zone::VARCHAR, 7) || '%'
+    LIMIT 1;
+
+    IF (:base_rate IS NULL) THEN
+        base_rate := 0.03;
+        risk_multiplier := 1.3;
+        geo_factor := 1.1;
+        history_factor := 1.0;
+    END IF;
+
+    -- Existing customer discount
+    LET existing_cust VARCHAR := :app:existing_customer_id::VARCHAR;
+    IF (:existing_cust IS NOT NULL AND :existing_cust != '') THEN
+        history_factor := :history_factor * 0.9;
+    END IF;
+
+    final_score := :base_rate * :risk_multiplier * :geo_factor * :history_factor;
+    rec_premium := :app:coverage_requested::FLOAT * :final_score;
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_RISK_SCORE',
+        'application_id', :app_id,
+        'risk_tier', :risk_tier,
+        'base_rate', :base_rate,
+        'risk_multiplier', :risk_multiplier,
+        'geographic_factor', :geo_factor,
+        'history_factor', :history_factor,
+        'composite_score', ROUND(:final_score, 6),
+        'recommended_premium', ROUND(:rec_premium, 0)
+    );
+END;
+$$;
+
+-- Step 2: Guideline lookup via Cortex Search
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_GUIDELINE_LOOKUP(app_id VARCHAR, risk_tier VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    lob VARCHAR;
+    guidelines VARIANT;
+BEGIN
+    lob := (SELECT lob_type FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+
+    guidelines := (
+        SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+            'INSURANCE_DB.VECTORS.UNDERWRITING_GUIDELINES_SEARCH_SERVICE',
+            OBJECT_CONSTRUCT(
+                'query', :lob || ' ' || :risk_tier || ' underwriting risk assessment',
+                'columns', ARRAY_CONSTRUCT('section_name', 'content', 'risk_level'),
+                'limit', 3
+            )::VARCHAR
+        ))
+    );
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_GUIDELINE_LOOKUP',
+        'application_id', :app_id,
+        'lob_type', :lob,
+        'risk_tier', :risk_tier,
+        'guidelines', :guidelines
+    );
+END;
+$$;
+
+-- Step 3: Final underwriting decision
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_DECISION(app_id VARCHAR, risk_output VARIANT, guideline_output VARIANT)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_tier VARCHAR;
+    rec_premium FLOAT;
+    auto_approved BOOLEAN;
+    rationale VARCHAR;
+    lob VARCHAR;
+    customer_id VARCHAR;
+BEGIN
+    risk_tier := :risk_output:risk_tier::VARCHAR;
+    rec_premium := :risk_output:recommended_premium::FLOAT;
+    lob := (SELECT lob_type FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+    customer_id := (SELECT existing_customer_id FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+
+    -- Auto-approve LOW risk
+    IF (:risk_tier = 'LOW') THEN
+        auto_approved := TRUE;
+        rationale := 'Auto-approved: LOW risk tier, credit score qualifies, actuarial rates favorable.';
+    ELSEIF (:risk_tier = 'MEDIUM') THEN
+        auto_approved := FALSE;
+        rationale := 'Manual review required: MEDIUM risk. Premium adjusted by risk multiplier.';
+    ELSE
+        auto_approved := FALSE;
+        rationale := 'Flagged for senior underwriter: HIGH risk. May require additional documentation.';
+        rec_premium := :rec_premium * 1.5;
+    END IF;
+
+    -- Write decision
+    INSERT INTO INSURANCE_DB.RESULTS.UNDERWRITING_DECISIONS
+        (application_id, customer_id, lob_type, risk_tier, confidence,
+         recommended_premium, auto_approved, rationale)
+    VALUES (:app_id, :customer_id, :lob, :risk_tier, 
+            CASE WHEN :risk_tier = 'LOW' THEN 0.95 WHEN :risk_tier = 'MEDIUM' THEN 0.7 ELSE 0.5 END,
+            :rec_premium, :auto_approved, :rationale);
+
+    -- Update application status
+    UPDATE INSURANCE_DB.RAW.APPLICATIONS 
+    SET status = CASE WHEN :auto_approved THEN 'APPROVED' ELSE 'REVIEW' END
+    WHERE application_id = :app_id;
+
+    -- Audit log
+    INSERT INTO INSURANCE_DB.RESULTS.AUDIT_LOG
+        (flow_type, reference_id, agent_name, step_number, cortex_module_used, status)
+    VALUES ('UNDERWRITING', :app_id, 'UW_DECISION', 3, 'SQL+SEARCH', 'SUCCESS');
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_DECISION',
+        'application_id', :app_id,
+        'risk_tier', :risk_tier,
+        'recommended_premium', :rec_premium,
+        'auto_approved', :auto_approved,
+        'rationale', :rationale
+    );
+END;
+$$;
+
+-- Orchestrator: chains all 3 underwriting steps
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_PROCESS_APPLICATION(app_id VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_result VARIANT;
+    guideline_result VARIANT;
+    decision_result VARIANT;
+    risk_tier VARCHAR;
+BEGIN
+    CALL INSURANCE_DB.PROCESSED.SP_UW_RISK_SCORE(:app_id);
+    risk_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    risk_tier := :risk_result:risk_tier::VARCHAR;
+
+    CALL INSURANCE_DB.PROCESSED.SP_UW_GUIDELINE_LOOKUP(:app_id, :risk_tier);
+    guideline_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    CALL INSURANCE_DB.PROCESSED.SP_UW_DECISION(:app_id, :risk_result, :guideline_result);
+    decision_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    RETURN 'Application ' || :app_id || ' processed. Risk: ' || :risk_tier ||
+           '. Premium: INR ' || :decision_result:recommended_premium::VARCHAR ||
+           '. Auto-approved: ' || :decision_result:auto_approved::VARCHAR;
+END;
+$$;

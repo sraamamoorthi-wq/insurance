@@ -4,6 +4,6 @@ default_target: 'DEV'
 
 targets:
   DEV:
-    account_identifier: HYCBLFU-HZ16841
+    account_identifier: RMCYMCI-AF72128
     project_name: 'INSURANCE_DB.RAW.INSURANCE_DCM_PROJECT'
     project_owner: RAAMAMOORTHIS

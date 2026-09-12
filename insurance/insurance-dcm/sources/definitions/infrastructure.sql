@@ -15,12 +15,6 @@ DEFINE SCHEMA INSURANCE_DB.RESULTS
 DEFINE SCHEMA INSURANCE_DB.VECTORS
     COMMENT = 'RAG embeddings - document chunks, fraud patterns';
 
-DEFINE SCHEMA INSURANCE_DB.FEATURES
-    COMMENT = 'ML Feature Store - numerical features for model training/serving';
-
-DEFINE SCHEMA INSURANCE_DB.STAGES
-    COMMENT = 'Internal stages for semantic models, documents, knowledge bases';
-
 -- Warehouses
 DEFINE WAREHOUSE AGENT_WH
     WAREHOUSE_SIZE = 'MEDIUM'
@@ -43,17 +37,13 @@ DEFINE WAREHOUSE INGEST_WH
     AUTO_RESUME = TRUE
     COMMENT = 'Data ingestion - Snowpipe, Stream consumption';
 
--- Internal Stages (STAGES schema)
-DEFINE STAGE INSURANCE_DB.STAGES.SEMANTIC_MODELS_STAGE
+-- Internal Stages (all in RAW schema)
+DEFINE STAGE INSURANCE_DB.RAW.SEMANTIC_MODELS_STAGE
     COMMENT = 'Cortex Analyst semantic model YAML files';
 
-DEFINE STAGE INSURANCE_DB.STAGES.DOCUMENTS_STAGE
-    COMMENT = 'Uploaded claim documents (PDFs, FIRs, invoices)';
-
-DEFINE STAGE INSURANCE_DB.STAGES.KNOWLEDGE_BASE_STAGE
+DEFINE STAGE INSURANCE_DB.RAW.KNOWLEDGE_BASE_STAGE
     COMMENT = 'RAG knowledge base documents (underwriting guides, playbooks)';
 
--- Internal Stages (RAW schema - from NB_07 document ingestion)
 DEFINE STAGE INSURANCE_DB.RAW.DOCUMENTS_STAGE
     DIRECTORY = (ENABLE = TRUE)
     ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE')
