@@ -3,6 +3,106 @@
 -- NOTE: Python agent procedures (SP_AGENT_*) are in post_deploy.sql
 -- ============================================================================
 
+-- Pipeline-level DQ validation (mirrors Streamlit UI checks)
+-- Returns VARIANT: {passed: BOOLEAN, errors: [...], warnings: [...]}
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_DQ_VALIDATE_CLAIM(p_claim_id VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    v_customer_id VARCHAR;
+    v_policy_id VARCHAR;
+    v_lob_type VARCHAR;
+    v_claimed_amount FLOAT;
+    v_errors ARRAY DEFAULT ARRAY_CONSTRUCT();
+    v_warnings ARRAY DEFAULT ARRAY_CONSTRUCT();
+    v_cust_count INT;
+    v_pol_count INT;
+    v_pol_status VARCHAR;
+    v_pol_customer VARCHAR;
+    v_pol_lob VARCHAR;
+    v_coverage_limit FLOAT;
+    v_dup_count INT;
+BEGIN
+    -- Fetch claim details
+    SELECT customer_id, policy_id, lob_type, claimed_amount
+    INTO :v_customer_id, :v_policy_id, :v_lob_type, :v_claimed_amount
+    FROM INSURANCE_DB.RAW.CLAIMS_LANDING
+    WHERE claim_id = :p_claim_id;
+
+    -- 1. Customer exists
+    v_cust_count := (SELECT COUNT(*) FROM INSURANCE_DB.RAW.CUSTOMERS WHERE customer_id = :v_customer_id);
+    IF (v_cust_count = 0) THEN
+        v_errors := ARRAY_APPEND(v_errors, 'CUSTOMER_NOT_FOUND: ' || COALESCE(:v_customer_id, 'NULL'));
+    END IF;
+
+    -- 2. Policy exists and is valid
+    IF (v_policy_id IS NOT NULL) THEN
+        v_pol_count := (SELECT COUNT(*) FROM INSURANCE_DB.RAW.POLICIES WHERE policy_id = :v_policy_id);
+        IF (v_pol_count = 0) THEN
+            v_errors := ARRAY_APPEND(v_errors, 'POLICY_NOT_FOUND: ' || :v_policy_id);
+        ELSE
+            SELECT policy_status, customer_id, lob_type, coverage_limit
+            INTO :v_pol_status, :v_pol_customer, :v_pol_lob, :v_coverage_limit
+            FROM INSURANCE_DB.RAW.POLICIES
+            WHERE policy_id = :v_policy_id;
+
+            -- 2a. Policy is active
+            IF (v_pol_status != 'ACTIVE') THEN
+                v_errors := ARRAY_APPEND(v_errors, 'POLICY_INACTIVE: status=' || :v_pol_status);
+            END IF;
+
+            -- 2b. Policy belongs to this customer
+            IF (v_pol_customer != v_customer_id) THEN
+                v_errors := ARRAY_APPEND(v_errors, 'POLICY_CUSTOMER_MISMATCH: policy belongs to ' || :v_pol_customer);
+            END IF;
+
+            -- 2c. LOB matches
+            IF (v_lob_type IS NOT NULL AND v_pol_lob != v_lob_type) THEN
+                v_warnings := ARRAY_APPEND(v_warnings, 'LOB_MISMATCH: claim=' || :v_lob_type || ' policy=' || :v_pol_lob);
+            END IF;
+
+            -- 3. Claim amount vs coverage limit
+            IF (v_claimed_amount > v_coverage_limit AND v_coverage_limit > 0) THEN
+                v_warnings := ARRAY_APPEND(v_warnings, 'EXCEEDS_COVERAGE: claimed=' || :v_claimed_amount::VARCHAR || ' limit=' || :v_coverage_limit::VARCHAR);
+            END IF;
+        END IF;
+    END IF;
+
+    -- 4. Required fields
+    IF (v_claimed_amount IS NULL OR v_claimed_amount <= 0) THEN
+        v_errors := ARRAY_APPEND(v_errors, 'INVALID_AMOUNT: claimed_amount is null or zero');
+    END IF;
+
+    IF (v_customer_id IS NULL) THEN
+        v_errors := ARRAY_APPEND(v_errors, 'MISSING_CUSTOMER_ID');
+    END IF;
+
+    -- 5. Duplicate claim check (same customer + LOB within 30 days)
+    v_dup_count := (
+        SELECT COUNT(*) FROM INSURANCE_DB.RAW.CLAIMS_LANDING
+        WHERE customer_id = :v_customer_id
+          AND lob_type = :v_lob_type
+          AND claim_id != :p_claim_id
+          AND submission_date >= DATEADD(day, -30, CURRENT_TIMESTAMP())
+          AND claim_status NOT IN ('DENIED', 'DQ_FAILED')
+    );
+    IF (v_dup_count > 0) THEN
+        v_warnings := ARRAY_APPEND(v_warnings, 'DUPLICATE_RISK: ' || :v_dup_count::VARCHAR || ' similar claim(s) in last 30 days');
+    END IF;
+
+    RETURN OBJECT_CONSTRUCT(
+        'passed', ARRAY_SIZE(v_errors) = 0,
+        'errors', v_errors,
+        'warnings', v_warnings,
+        'claim_id', p_claim_id,
+        'customer_id', v_customer_id
+    );
+END;
+$$;
+
 -- Claims orchestrator (chains all 5 agents)
 DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM(claim_id VARCHAR)
 RETURNS VARCHAR
@@ -29,7 +129,7 @@ BEGIN
 END;
 $$;
 
--- Batch claims processor
+-- Batch claims processor (with DQ gate)
 DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_PROCESS_ALL_CLAIMS()
 RETURNS VARCHAR
 LANGUAGE SQL
@@ -38,19 +138,43 @@ AS
 $$
 DECLARE
     cnt INT DEFAULT 0;
+    dq_fail_cnt INT DEFAULT 0;
     cur_claim VARCHAR;
-BEGIN
-    FOR rec IN (
+    dq_result VARIANT;
+    res RESULTSET DEFAULT (
         SELECT claim_id FROM INSURANCE_DB.RAW.CLAIMS_LANDING
         WHERE claim_status = 'SUBMITTED'
         ORDER BY submission_date ASC LIMIT 20
-    ) DO
+    );
+    cur CURSOR FOR res;
+BEGIN
+    FOR rec IN cur DO
         cur_claim := rec.claim_id;
-        CALL INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM(:cur_claim);
-        cnt := cnt + 1;
+
+        -- DQ gate: validate before processing
+        CALL INSURANCE_DB.PROCESSED.SP_DQ_VALIDATE_CLAIM(:cur_claim);
+        dq_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+        IF (dq_result:passed::BOOLEAN = TRUE) THEN
+            -- DQ passed: process through 5-agent pipeline
+            CALL INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM(:cur_claim);
+            cnt := cnt + 1;
+        ELSE
+            -- DQ failed: mark claim and log
+            UPDATE INSURANCE_DB.RAW.CLAIMS_LANDING
+            SET claim_status = 'DQ_FAILED',
+                metadata = :dq_result
+            WHERE claim_id = :cur_claim;
+
+            INSERT INTO INSURANCE_DB.RESULTS.AUDIT_LOG
+                (flow_type, reference_id, agent_name, step_number, status, output_payload)
+            SELECT 'CLAIMS', :cur_claim, 'DQ_VALIDATOR', 0, 'DQ_FAILED', :dq_result;
+
+            dq_fail_cnt := dq_fail_cnt + 1;
+        END IF;
     END FOR;
 
-    RETURN 'Batch complete. Processed ' || :cnt::VARCHAR || ' claims.';
+    RETURN 'Batch complete. Processed: ' || :cnt::VARCHAR || ', DQ failed: ' || :dq_fail_cnt::VARCHAR;
 END;
 $$;
 
@@ -73,18 +197,18 @@ BEGIN
     );
 
     result := (
-        SELECT PARSE_JSON(
+        SELECT TRY_PARSE_JSON(
+            REGEXP_SUBSTR(
             SNOWFLAKE.CORTEX.COMPLETE(
-                'mistral-large2',
+                'llama3.3-70b',
                 CONCAT(
-                    'Analyze these customer interaction transcripts and extract numerical signals. Return ONLY valid JSON.\n',
+                    'Analyze these customer interaction transcripts and extract numerical signals. Return ONLY a single JSON object, nothing else.\n',
                     '{"frustration_level": 0.0-1.0, "intent_cancel_detected": true/false, ',
                     '"competitor_mentions_count": integer, "emotional_manipulation_flag": true/false, ',
                     '"digital_engagement_trend": -1.0 to 1.0, "overall_satisfaction": 0.0-1.0}\n\n',
                     'TRANSCRIPTS:\n', COALESCE(:interaction_text, 'No recent interactions')
-                ),
-                OBJECT_CONSTRUCT('temperature', 0.1, 'max_tokens', 300)
-            )
+                )
+            ), '\\{[^{}]*\\}')
         )
     );
 
@@ -261,19 +385,19 @@ BEGIN
     FROM (
         SELECT
             i.customer_id,
-            PARSE_JSON(
+            TRY_PARSE_JSON(
+                REGEXP_SUBSTR(
                 SNOWFLAKE.CORTEX.COMPLETE(
-                    'mistral-large2',
+'llama3.3-70b',
                     CONCAT(
-                        'Analyze these customer interactions. Return JSON only: ',
+                        'Analyze these customer interactions. Return ONLY a single JSON object, nothing else: ',
                         '{"frustration_level": 0.0-1.0, "intent_cancel_detected": bool, ',
                         '"competitor_mentions_count": int, "digital_engagement_trend": -1 to 1, ',
                         '"emotional_manipulation_flag": bool}\n\nTranscripts:\n',
                         LISTAGG(LEFT(i.transcript_text, 500), '\n---\n')
                             WITHIN GROUP (ORDER BY i.interaction_date DESC)
-                    ),
-                    OBJECT_CONSTRUCT('temperature', 0.1, 'max_tokens', 200)
-                )
+                    )
+                ), '\\{[^{}]*\\}')
             ) AS val
         FROM INSURANCE_DB.RAW.INTERACTIONS i
         WHERE i.interaction_date >= DATEADD(day, -90, CURRENT_TIMESTAMP())
@@ -385,9 +509,10 @@ BEGIN
     );
 
     root_cause_result := (
-        SELECT PARSE_JSON(
+        SELECT TRY_PARSE_JSON(
+            REGEXP_SUBSTR(
             SNOWFLAKE.CORTEX.COMPLETE(
-                'mistral-large2',
+                'llama3.3-70b',
                 CONCAT(
                     'You are a customer retention analyst. Analyze this at-risk customer and determine the PRIMARY root cause of potential churn.\n\n',
                     'CUSTOMER PROFILE:\n', :customer_context, '\n\n',
@@ -400,14 +525,13 @@ BEGIN
                     '- competitor_offer: Actively shopping, received competitor quote\n',
                     '- life_event: Moving, downsizing, life change reducing need\n',
                     '- payment_difficulty: Financial stress, struggling to pay premium\n\n',
-                    'Return ONLY valid JSON:\n',
+                    'Return ONLY valid JSON, no markdown fences:\n',
                     '{"root_cause": "one_of_above", "confidence": 0.0-1.0, ',
                     '"evidence": "2-3 sentence explanation of why this is the root cause", ',
                     '"secondary_cause": "one_of_above or null", ',
                     '"urgency": "LOW|MEDIUM|HIGH|CRITICAL"}'
-                ),
-                OBJECT_CONSTRUCT('temperature', 0.2, 'max_tokens', 400)
-            )
+                )
+            ), '\\{[^{}]*\\}')
         )
     );
 
@@ -450,22 +574,24 @@ BEGIN
     );
 
     playbook_context := (
-        SELECT SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
-            'INSURANCE_DB.VECTORS.RETENTION_PLAYBOOKS_SEARCH_SERVICE',
-            CONCAT(
-                '{"query": "', COALESCE(:root_cause, 'general retention'),
-                ' ', COALESCE(:customer_segment, 'standard'), ' customer retention strategy",',
-                '"columns": ["playbook_name", "content", "success_rate"],',
-                '"filter": {"@eq": {"customer_segment": "', COALESCE(:customer_segment, 'STANDARD'), '"}},',
-                '"limit": 2}'
-            )
+        SELECT COALESCE(
+            LISTAGG(
+                CONCAT(playbook_name, ': ', LEFT(content, 500), ' (success rate: ', success_rate::VARCHAR, ')'),
+                '\n---\n'
+            ) WITHIN GROUP (ORDER BY success_rate DESC),
+            'No matching playbooks found'
         )
+        FROM INSURANCE_DB.RAW.RETENTION_PLAYBOOKS
+        WHERE customer_segment = COALESCE(:customer_segment, 'STANDARD')
+           OR root_cause = COALESCE(:root_cause, '')
+        LIMIT 3
     );
 
     nba_result := (
-        SELECT PARSE_JSON(
+        SELECT TRY_PARSE_JSON(
+            REGEXP_SUBSTR(
             SNOWFLAKE.CORTEX.COMPLETE(
-                'mistral-large2',
+                'llama3.3-70b',
                 CONCAT(
                     'You are a retention specialist. Generate a personalized retention action for this customer.\n\n',
                     'CUSTOMER: ', :p_customer_id,
@@ -473,7 +599,7 @@ BEGIN
                     ' | LTV: ', COALESCE(:ltv_score::VARCHAR, '0.5'),
                     ' | Root Cause: ', COALESCE(:root_cause, 'unknown'), '\n\n',
                     'RETENTION PLAYBOOKS (RAG):\n', COALESCE(:playbook_context, 'No playbook found'), '\n\n',
-                    'Generate a specific, actionable retention plan. Return ONLY valid JSON:\n',
+                    'Generate a specific, actionable retention plan. Return ONLY valid JSON, no markdown fences:\n',
                     '{"action_type": "RETAIN|CROSS_SELL|ESCALATE|MONITOR",\n',
                     '"offer_details": "specific personalized offer description",\n',
                     '"channel": "CALL|EMAIL|SMS",\n',
@@ -482,31 +608,32 @@ BEGIN
                     '"talking_points": ["point1", "point2", "point3"],\n',
                     '"escalation_needed": true/false,\n',
                     '"budget_required": "amount in INR or null"}'
-                ),
-                OBJECT_CONSTRUCT('temperature', 0.3, 'max_tokens', 500)
-            )
+                )
+            ), '\\{[^{}]*\\}')
         )
     );
+
+    LET v_priority INT := (SELECT priority FROM INSURANCE_DB.PROCESSED.CHURN_ALERTS
+         WHERE customer_id = :p_customer_id ORDER BY alert_date DESC LIMIT 1);
+    LET v_rationale VARCHAR := CONCAT('Root cause: ', COALESCE(:root_cause, 'unknown'),
+               '. Talking points: ', COALESCE(:nba_result:talking_points::VARCHAR, 'N/A'));
 
     INSERT INTO INSURANCE_DB.PROCESSED.NEXT_BEST_ACTIONS
         (customer_id, action_type, offer_details, channel, timing,
          priority, expected_success_rate, root_cause, rationale, status,
          expiry_date)
-    VALUES (
+    SELECT
         :p_customer_id,
         :nba_result:action_type::VARCHAR,
         :nba_result:offer_details::VARCHAR,
         :nba_result:channel::VARCHAR,
         :nba_result:timing::VARCHAR,
-        (SELECT priority FROM INSURANCE_DB.PROCESSED.CHURN_ALERTS
-         WHERE customer_id = :p_customer_id ORDER BY alert_date DESC LIMIT 1),
+        :v_priority,
         :nba_result:expected_success_rate::FLOAT,
         :root_cause,
-        CONCAT('Root cause: ', COALESCE(:root_cause, 'unknown'),
-               '. Talking points: ', COALESCE(:nba_result:talking_points::VARCHAR, 'N/A')),
+        :v_rationale,
         'PENDING',
-        DATEADD(day, 14, CURRENT_DATE())
-    );
+        DATEADD(day, 14, CURRENT_DATE());
 
     UPDATE INSURANCE_DB.PROCESSED.CHURN_ALERTS
     SET status = 'ACTIONED'
@@ -533,25 +660,28 @@ BEGIN
 
     alert_count := (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CHURN_ALERTS WHERE alert_date = CURRENT_DATE() AND status = 'NEW');
 
-    FOR record IN (
+    LET res RESULTSET := (
         SELECT customer_id
         FROM INSURANCE_DB.PROCESSED.CHURN_ALERTS
         WHERE alert_date = CURRENT_DATE() AND status = 'NEW'
         ORDER BY priority ASC
         LIMIT 100
-    ) DO
+    );
+    LET cur CURSOR FOR res;
+
+    FOR record IN cur DO
         cur_customer := record.customer_id;
         CALL INSURANCE_DB.PROCESSED.SP_CHURN_ROOT_CAUSE(:cur_customer);
         CALL INSURANCE_DB.PROCESSED.SP_GENERATE_RETENTION_NBA(:cur_customer);
         processed_count := processed_count + 1;
     END FOR;
 
+    LET audit_payload VARIANT := (SELECT PARSE_JSON(CONCAT('{"alerts_found": ', :alert_count::VARCHAR,
+                         ', "processed": ', :processed_count::VARCHAR, '}')));
+
     INSERT INTO INSURANCE_DB.RESULTS.AUDIT_LOG
         (flow_type, reference_id, agent_name, step_number, status, output_payload)
-    VALUES
-        ('CHURN', 'BATCH_' || CURRENT_DATE()::VARCHAR, 'CHURN_PIPELINE', 0, 'SUCCESS',
-         PARSE_JSON(CONCAT('{"alerts_found": ', :alert_count::VARCHAR,
-                          ', "processed": ', :processed_count::VARCHAR, '}')));
+    SELECT 'CHURN', 'BATCH_' || CURRENT_DATE()::VARCHAR, 'CHURN_PIPELINE', 0, 'SUCCESS', :audit_payload;
 
     RETURN CONCAT('Churn pipeline complete. Alerts: ', :alert_count::VARCHAR,
                   ', Processed: ', :processed_count::VARCHAR);
@@ -621,13 +751,15 @@ AS
 $$
 DECLARE
     processed_count INT DEFAULT 0;
-BEGIN
-    FOR doc IN (
+    res RESULTSET DEFAULT (
         SELECT document_id, stage_path
         FROM INSURANCE_DB.RAW.DOCUMENT_REGISTRY
         WHERE extraction_status = 'PENDING'
         LIMIT 50
-    ) DO
+    );
+    cur CURSOR FOR res;
+BEGIN
+    FOR doc IN cur DO
         BEGIN
             CALL INSURANCE_DB.RAW.SP_PROCESS_UPLOADED_DOCUMENT(doc.document_id);
             processed_count := processed_count + 1;
@@ -640,5 +772,221 @@ BEGIN
     END FOR;
 
     RETURN 'Processed ' || :processed_count::VARCHAR || ' documents';
+END;
+$$;
+
+-- ============================================================================
+-- UNDERWRITING PIPELINE: 3-step application assessment
+-- ============================================================================
+
+-- Step 1: Risk scoring based on applicant data + actuarial tables
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_RISK_SCORE(app_id VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_tier VARCHAR;
+    base_rate FLOAT;
+    risk_multiplier FLOAT;
+    geo_factor FLOAT;
+    history_factor FLOAT;
+    credit_adj FLOAT;
+    final_score FLOAT;
+    rec_premium FLOAT;
+BEGIN
+    LET app VARIANT := (
+        SELECT OBJECT_CONSTRUCT(
+            'application_id', application_id,
+            'lob_type', lob_type,
+            'coverage_requested', coverage_requested,
+            'credit_score', credit_score,
+            'geographic_zone', geographic_zone,
+            'existing_customer_id', existing_customer_id
+        )
+        FROM INSURANCE_DB.RAW.APPLICATIONS
+        WHERE application_id = :app_id
+    );
+
+    IF (:app IS NULL) THEN
+        RETURN OBJECT_CONSTRUCT('status', 'ERROR', 'error', 'Application not found');
+    END IF;
+
+    -- Credit score -> risk tier
+    LET credit INT := :app:credit_score::INT;
+    IF (:credit >= 750) THEN
+        risk_tier := 'LOW';
+    ELSEIF (:credit >= 650) THEN
+        risk_tier := 'MEDIUM';
+    ELSE
+        risk_tier := 'HIGH';
+    END IF;
+
+    -- Lookup actuarial rates
+    SELECT base_rate, risk_multiplier, geographic_factor, claims_history_factor
+    INTO :base_rate, :risk_multiplier, :geo_factor, :history_factor
+    FROM INSURANCE_DB.RAW.ACTUARIAL_TABLES
+    WHERE lob_type = :app:lob_type::VARCHAR
+      AND risk_tier = :risk_tier
+      AND geographic_zone LIKE '%' || LEFT(:app:geographic_zone::VARCHAR, 7) || '%'
+    LIMIT 1;
+
+    IF (:base_rate IS NULL) THEN
+        base_rate := 0.03;
+        risk_multiplier := 1.3;
+        geo_factor := 1.1;
+        history_factor := 1.0;
+    END IF;
+
+    -- Existing customer discount
+    LET existing_cust VARCHAR := :app:existing_customer_id::VARCHAR;
+    IF (:existing_cust IS NOT NULL AND :existing_cust != '') THEN
+        history_factor := :history_factor * 0.9;
+    END IF;
+
+    final_score := :base_rate * :risk_multiplier * :geo_factor * :history_factor;
+    rec_premium := :app:coverage_requested::FLOAT * :final_score;
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_RISK_SCORE',
+        'application_id', :app_id,
+        'risk_tier', :risk_tier,
+        'base_rate', :base_rate,
+        'risk_multiplier', :risk_multiplier,
+        'geographic_factor', :geo_factor,
+        'history_factor', :history_factor,
+        'composite_score', ROUND(:final_score, 6),
+        'recommended_premium', ROUND(:rec_premium, 0)
+    );
+END;
+$$;
+
+-- Step 2: Guideline lookup via Cortex Search
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_GUIDELINE_LOOKUP(app_id VARCHAR, risk_tier VARCHAR)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    lob VARCHAR;
+    guidelines VARIANT;
+BEGIN
+    lob := (SELECT lob_type FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+
+    guidelines := (
+        SELECT PARSE_JSON(SNOWFLAKE.CORTEX.SEARCH_PREVIEW(
+            'INSURANCE_DB.VECTORS.UNDERWRITING_GUIDELINES_SEARCH_SERVICE',
+            OBJECT_CONSTRUCT(
+                'query', :lob || ' ' || :risk_tier || ' underwriting risk assessment',
+                'columns', ARRAY_CONSTRUCT('section_name', 'content', 'risk_level'),
+                'limit', 3
+            )::VARCHAR
+        ))
+    );
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_GUIDELINE_LOOKUP',
+        'application_id', :app_id,
+        'lob_type', :lob,
+        'risk_tier', :risk_tier,
+        'guidelines', :guidelines
+    );
+END;
+$$;
+
+-- Step 3: Final underwriting decision
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_UW_DECISION(app_id VARCHAR, risk_output VARIANT, guideline_output VARIANT)
+RETURNS VARIANT
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_tier VARCHAR;
+    rec_premium FLOAT;
+    auto_approved BOOLEAN;
+    rationale VARCHAR;
+    lob VARCHAR;
+    customer_id VARCHAR;
+BEGIN
+    risk_tier := :risk_output:risk_tier::VARCHAR;
+    rec_premium := :risk_output:recommended_premium::FLOAT;
+    lob := (SELECT lob_type FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+    customer_id := (SELECT existing_customer_id FROM INSURANCE_DB.RAW.APPLICATIONS WHERE application_id = :app_id);
+
+    -- Auto-approve LOW risk
+    IF (:risk_tier = 'LOW') THEN
+        auto_approved := TRUE;
+        rationale := 'Auto-approved: LOW risk tier, credit score qualifies, actuarial rates favorable.';
+    ELSEIF (:risk_tier = 'MEDIUM') THEN
+        auto_approved := FALSE;
+        rationale := 'Manual review required: MEDIUM risk. Premium adjusted by risk multiplier.';
+    ELSE
+        auto_approved := FALSE;
+        rationale := 'Flagged for senior underwriter: HIGH risk. May require additional documentation.';
+        rec_premium := :rec_premium * 1.5;
+    END IF;
+
+    -- Write decision
+    INSERT INTO INSURANCE_DB.RESULTS.UNDERWRITING_DECISIONS
+        (application_id, customer_id, lob_type, risk_tier, confidence,
+         recommended_premium, auto_approved, rationale)
+    VALUES (:app_id, :customer_id, :lob, :risk_tier, 
+            CASE WHEN :risk_tier = 'LOW' THEN 0.95 WHEN :risk_tier = 'MEDIUM' THEN 0.7 ELSE 0.5 END,
+            :rec_premium, :auto_approved, :rationale);
+
+    -- Update application status
+    UPDATE INSURANCE_DB.RAW.APPLICATIONS 
+    SET status = CASE WHEN :auto_approved THEN 'APPROVED' ELSE 'REVIEW' END
+    WHERE application_id = :app_id;
+
+    -- Audit log
+    INSERT INTO INSURANCE_DB.RESULTS.AUDIT_LOG
+        (flow_type, reference_id, agent_name, step_number, cortex_module_used, status)
+    VALUES ('UNDERWRITING', :app_id, 'UW_DECISION', 3, 'SQL+SEARCH', 'SUCCESS');
+
+    RETURN OBJECT_CONSTRUCT(
+        'status', 'SUCCESS',
+        'agent', 'UW_DECISION',
+        'application_id', :app_id,
+        'risk_tier', :risk_tier,
+        'recommended_premium', :rec_premium,
+        'auto_approved', :auto_approved,
+        'rationale', :rationale
+    );
+END;
+$$;
+
+-- Orchestrator: chains all 3 underwriting steps
+DEFINE PROCEDURE INSURANCE_DB.PROCESSED.SP_PROCESS_APPLICATION(app_id VARCHAR)
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS CALLER
+AS
+$$
+DECLARE
+    risk_result VARIANT;
+    guideline_result VARIANT;
+    decision_result VARIANT;
+    risk_tier VARCHAR;
+BEGIN
+    CALL INSURANCE_DB.PROCESSED.SP_UW_RISK_SCORE(:app_id);
+    risk_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    risk_tier := :risk_result:risk_tier::VARCHAR;
+
+    CALL INSURANCE_DB.PROCESSED.SP_UW_GUIDELINE_LOOKUP(:app_id, :risk_tier);
+    guideline_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    CALL INSURANCE_DB.PROCESSED.SP_UW_DECISION(:app_id, :risk_result, :guideline_result);
+    decision_result := (SELECT * FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
+
+    RETURN 'Application ' || :app_id || ' processed. Risk: ' || :risk_tier ||
+           '. Premium: INR ' || :decision_result:recommended_premium::VARCHAR ||
+           '. Auto-approved: ' || :decision_result:auto_approved::VARCHAR;
 END;
 $$;

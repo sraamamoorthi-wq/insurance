@@ -96,20 +96,27 @@ SELECT
 FROM INSURANCE_DB.RAW.INTERACTIONS
 GROUP BY customer_id;
 
--- Embedding features
+-- Embedding features (CTE avoids nested-aggregate error from inlined UDF)
 DEFINE VIEW INSURANCE_DB.PROCESSED.V_AGG_EMBEDDING_FEATURES AS
+WITH claim_scores AS (
+    SELECT
+        cl.customer_id,
+        cl.lob_type,
+        INSURANCE_DB.VECTORS.COMPUTE_FRAUD_SIMILARITY(cl.claim_text) AS fraud_sim
+    FROM INSURANCE_DB.RAW.CLAIMS_LANDING cl
+)
 SELECT
-    cl.customer_id,
-    MAX(INSURANCE_DB.VECTORS.COMPUTE_FRAUD_SIMILARITY(cl.claim_text)) AS fraud_similarity_score,
+    cs.customer_id,
+    MAX(cs.fraud_sim) AS fraud_similarity_score,
     CASE
-        WHEN MAX(INSURANCE_DB.VECTORS.COMPUTE_FRAUD_SIMILARITY(cl.claim_text)) > 0.7 THEN 1
-        WHEN MAX(INSURANCE_DB.VECTORS.COMPUTE_FRAUD_SIMILARITY(cl.claim_text)) > 0.4 THEN 2
+        WHEN MAX(cs.fraud_sim) > 0.7 THEN 1
+        WHEN MAX(cs.fraud_sim) > 0.4 THEN 2
         ELSE 3
     END AS claim_cluster_id,
     MAX(CASE WHEN p.risk_flag = TRUE THEN 0.8 ELSE 0.0 END) AS provider_anomaly_score
-FROM INSURANCE_DB.RAW.CLAIMS_LANDING cl
-LEFT JOIN INSURANCE_DB.RAW.PROVIDERS p ON p.lob_type = cl.lob_type AND p.risk_flag = TRUE
-GROUP BY cl.customer_id;
+FROM claim_scores cs
+LEFT JOIN INSURANCE_DB.RAW.PROVIDERS p ON p.lob_type = cs.lob_type AND p.risk_flag = TRUE
+GROUP BY cs.customer_id;
 
 -- Churn dashboard
 DEFINE VIEW INSURANCE_DB.PROCESSED.V_CHURN_DASHBOARD AS

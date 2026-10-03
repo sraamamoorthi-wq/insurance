@@ -6,4 +6,9 @@ targets:
   DEV:
     account_identifier: RMCYMCI-AF72128
     project_name: 'INSURANCE_DB.RAW.INSURANCE_DCM_PROJECT'
-    project_owner: RAAMAMOORTHIS
+    project_owner: ACCOUNTADMIN
+
+  PROD:
+    account_identifier: '<TARGET_ACCOUNT_IDENTIFIER>'
+    project_name: 'INSURANCE_DB.RAW.INSURANCE_DCM_PROJECT'
+    project_owner: '<TARGET_DEPLOYER_USERNAME>'

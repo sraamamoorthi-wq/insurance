@@ -15,3 +15,8 @@ entities:
     query_warehouse: AGENT_WH
     compute_pool: SYSTEM_COMPUTE_POOL_CPU
     runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    run_mode: SpcsOnly
+    execute_as: OWNER
+    sharing:
+      - role: ACCOUNTADMIN
+        with_grant_option: true

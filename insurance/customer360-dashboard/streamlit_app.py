@@ -9,7 +9,7 @@ session = conn.session()
 session.sql("USE DATABASE INSURANCE_DB").collect()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)
 def run_query(sql):
     return conn.query(sql)
 
@@ -50,6 +50,7 @@ with st.sidebar:
 
     if st.button("Refresh data", key="refresh"):
         run_query.clear()
+        st.rerun()
 
 seg_filter = ",".join([f"'{s}'" for s in sel_segments]) if sel_segments else "''"
 lob_filter = ",".join([f"'{l}'" for l in sel_lobs]) if sel_lobs else "''"

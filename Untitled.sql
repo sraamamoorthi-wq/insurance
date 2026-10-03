@@ -19,3 +19,5 @@ FROM INSURANCE_DB.VECTORS.FRAUD_PATTERN_EMBEDDINGS
 
 
 ORDER BY severity;
+
+select * from claims_landing

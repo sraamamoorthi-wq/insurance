@@ -10,7 +10,7 @@ DEFINE TASK INSURANCE_DB.PROCESSED.TASK_CLAIMS_ORCHESTRATOR
     COMMENT = 'Processes new claims through 5-agent pipeline when stream has data'
     WHEN SYSTEM$STREAM_HAS_DATA('INSURANCE_DB.RAW.CLAIMS_LANDING_STREAM')
 AS
-    CALL INSURANCE_DB.PROCESSED.SP_ORCHESTRATE_BATCH();
+    CALL INSURANCE_DB.PROCESSED.SP_PROCESS_ALL_CLAIMS();
 
 -- Event-driven: processes new applications through underwriting pipeline (1-min poll)
 DEFINE TASK INSURANCE_DB.PROCESSED.TASK_UNDERWRITING_ORCHESTRATOR
@@ -21,11 +21,13 @@ DEFINE TASK INSURANCE_DB.PROCESSED.TASK_UNDERWRITING_ORCHESTRATOR
     WHEN SYSTEM$STREAM_HAS_DATA('INSURANCE_DB.RAW.APPLICATIONS_STREAM')
 AS
 BEGIN
-    FOR app IN (
+    LET res RESULTSET := (
         SELECT application_id FROM INSURANCE_DB.RAW.APPLICATIONS
         WHERE status = 'PENDING'
         ORDER BY submission_date ASC LIMIT 10
-    ) DO
+    );
+    LET cur CURSOR FOR res;
+    FOR app IN cur DO
         CALL INSURANCE_DB.PROCESSED.SP_PROCESS_APPLICATION(app.application_id);
     END FOR;
 END;
@@ -130,15 +132,17 @@ BEGIN
     )
     AND claim_status NOT IN ('MANUAL_REVIEW', 'APPROVED', 'DENIED', 'REFERRED');
 
+    LET pending_cnt INT := (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE current_state NOT IN ('COMPLETED', 'FAILED'));
+    LET failed_cnt INT := (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE current_state = 'FAILED');
+    LET completed_cnt INT := (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE completed_at >= CURRENT_DATE());
+    LET payload VARIANT := (SELECT OBJECT_CONSTRUCT(
+        'timestamp', CURRENT_TIMESTAMP()::VARCHAR,
+        'pending_claims', :pending_cnt,
+        'failed_claims', :failed_cnt,
+        'completed_today', :completed_cnt
+    ));
+
     INSERT INTO INSURANCE_DB.RESULTS.AUDIT_LOG
         (flow_type, reference_id, agent_name, step_number, status, output_payload)
-    VALUES (
-        'SYSTEM', 'HEALTH_CHECK', 'MONITOR', 0, 'SUCCESS',
-        OBJECT_CONSTRUCT(
-            'timestamp', CURRENT_TIMESTAMP(),
-            'pending_claims', (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE current_state NOT IN ('COMPLETED', 'FAILED')),
-            'failed_claims', (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE current_state = 'FAILED'),
-            'completed_today', (SELECT COUNT(*) FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE completed_at >= CURRENT_DATE())
-        )
-    );
+    SELECT 'SYSTEM', 'HEALTH_CHECK', 'MONITOR', 0, 'SUCCESS', :payload;
 END;

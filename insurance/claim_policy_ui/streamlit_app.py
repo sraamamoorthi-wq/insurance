@@ -67,6 +67,57 @@ st.sidebar.caption("All files stored inside Snowflake")
 # ============================================================
 # HELPER: Upload file to Internal Stage
 # ============================================================
+def validate_customer(customer_id):
+    """Check if customer exists in CUSTOMERS table. Returns (exists, message)."""
+    if not customer_id or not customer_id.strip():
+        return False, "Customer ID is required."
+    result = session.sql(f"""
+        SELECT CUSTOMER_ID, FIRST_NAME, LAST_NAME, KYC_STATUS
+        FROM RAW.CUSTOMERS
+        WHERE CUSTOMER_ID = '{customer_id.strip()}'
+    """).to_pandas()
+    if result.empty:
+        return False, f"Customer '{customer_id}' does not exist in the system."
+    kyc = result.iloc[0]['KYC_STATUS']
+    if kyc and kyc not in ('VERIFIED', 'APPROVED'):
+        return False, f"Customer '{customer_id}' has KYC status '{kyc}'. Only VERIFIED customers can submit claims."
+    return True, None
+
+
+def validate_policy(policy_number, customer_id, expected_lob):
+    """Check policy exists, belongs to customer, matches LOB, and is active. Returns (valid, message)."""
+    if not policy_number or not policy_number.strip():
+        return False, "Policy Number is required."
+    result = session.sql(f"""
+        SELECT POLICY_ID, CUSTOMER_ID, LOB_TYPE, POLICY_STATUS, START_DATE, END_DATE
+        FROM RAW.POLICIES
+        WHERE POLICY_ID = '{policy_number.strip()}'
+    """).to_pandas()
+    if result.empty:
+        return False, f"Policy '{policy_number}' does not exist. Please check the policy number."
+    row = result.iloc[0]
+    if row['CUSTOMER_ID'] != customer_id.strip():
+        return False, f"Policy '{policy_number}' does not belong to customer '{customer_id}'."
+    if row['LOB_TYPE'] != expected_lob:
+        return False, f"Policy '{policy_number}' is a {row['LOB_TYPE']} policy, but this is an {expected_lob} claim form."
+    if row['POLICY_STATUS'] not in ('ACTIVE', 'RENEWAL_PENDING'):
+        return False, f"Policy '{policy_number}' has status '{row['POLICY_STATUS']}'. Only ACTIVE policies can have claims."
+    return True, None
+
+
+def validate_claim_basics(claim_amount, incident_date, claim_description):
+    """Validate basic claim fields. Returns list of error messages."""
+    errors = []
+    if claim_amount is None or claim_amount <= 0:
+        errors.append("Claim amount must be greater than zero.")
+    from datetime import date
+    if incident_date and incident_date > date.today():
+        errors.append("Incident date cannot be in the future.")
+    if not claim_description or not claim_description.strip():
+        errors.append("Claim description is required.")
+    return errors
+
+
 def upload_to_stage(uploaded_file, stage_name, subfolder):
     """
     Upload a file to Snowflake Internal Stage.
@@ -260,48 +311,63 @@ if page == "🚗 Auto Claim":
         run_now = st.checkbox("⚡ Run AI pipeline immediately after submit", value=False, key="auto_run")
         submitted = st.form_submit_button("📤 Submit Auto Claim", use_container_width=True)
         
-        if submitted and customer_id and policy_number and claim_description:
-            # Upload documents to Internal Stage
-            police_path = None
-            if police_report_file:
-                police_path, size = upload_to_stage(police_report_file, "EVIDENCE_STAGE", f"police/{customer_id}")
-                register_document(None, None, customer_id, 'AUTO',
-                                'POLICE_FIR', police_report_file.name, police_path, size, 'streamlit_user')
-            
-            estimate_path = None
-            if garage_estimate_file:
-                estimate_path, size = upload_to_stage(garage_estimate_file, "DOCUMENTS_STAGE", f"auto/{customer_id}")
-                register_document(None, None, customer_id, 'AUTO',
-                                'GARAGE_ESTIMATE', garage_estimate_file.name, estimate_path, size, 'streamlit_user')
-            
-            # Insert claim record (LOB-specific table)
-            session.sql(f"""
-                INSERT INTO RAW.AUTO_CLAIMS 
-                    (customer_id, policy_number, incident_date, claim_amount,
-                     claim_type, fault_determination, repair_shop_id,
-                     claim_description, witness_statement,
-                     submitted_by)
-                SELECT
-                    '{customer_id}', '{policy_number}', '{incident_date}', {claim_amount},
-                    '{claim_type}', '{fault_determination}', '{repair_shop_id}',
-                    '{claim_description.replace(chr(39), chr(39)+chr(39))}',
-                    '{witness_statement.replace(chr(39), chr(39)+chr(39))}',
-                    'streamlit_user'
-            """).collect()
-            
-            # Insert into CLAIMS_LANDING and capture claim_id
-            new_claim_id = submit_claim_to_landing(
-                policy_number, customer_id, claim_description,
-                incident_date, claim_amount, 'AUTO', None
-            )
-            
-            st.success(f"✅ Auto claim submitted! Claim ID: **{new_claim_id}**")
-            st.info(f"📁 Police report: {'✅' if police_path else '—'} | Garage estimate: {'✅' if estimate_path else '—'}")
-            
-            if run_now:
-                run_pipeline_and_show(new_claim_id)
+        if submitted:
+            # --- DQ Validation ---
+            validation_errors = []
+            cust_ok, cust_msg = validate_customer(customer_id)
+            if not cust_ok:
+                validation_errors.append(cust_msg)
+            pol_ok, pol_msg = validate_policy(policy_number, customer_id, 'AUTO')
+            if not pol_ok:
+                validation_errors.append(pol_msg)
+            basic_errors = validate_claim_basics(claim_amount, incident_date, claim_description)
+            validation_errors.extend(basic_errors)
+
+            if validation_errors:
+                for err in validation_errors:
+                    st.error(f"❌ {err}")
             else:
-                st.caption("Claim is queued. Run `CALL INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM('" + str(new_claim_id) + "')` or use the Tasks automation.")
+                # Upload documents to Internal Stage
+                police_path = None
+                if police_report_file:
+                    police_path, size = upload_to_stage(police_report_file, "EVIDENCE_STAGE", f"police/{customer_id}")
+                    register_document(None, None, customer_id, 'AUTO',
+                                    'POLICE_FIR', police_report_file.name, police_path, size, 'streamlit_user')
+                
+                estimate_path = None
+                if garage_estimate_file:
+                    estimate_path, size = upload_to_stage(garage_estimate_file, "DOCUMENTS_STAGE", f"auto/{customer_id}")
+                    register_document(None, None, customer_id, 'AUTO',
+                                    'GARAGE_ESTIMATE', garage_estimate_file.name, estimate_path, size, 'streamlit_user')
+                
+                # Insert claim record (LOB-specific table)
+                session.sql(f"""
+                    INSERT INTO RAW.AUTO_CLAIMS 
+                        (customer_id, policy_number, incident_date, claim_amount,
+                         claim_type, fault_determination, repair_shop_id,
+                         claim_description, witness_statement,
+                         submitted_by)
+                    SELECT
+                        '{customer_id}', '{policy_number}', '{incident_date}', {claim_amount},
+                        '{claim_type}', '{fault_determination}', '{repair_shop_id}',
+                        '{claim_description.replace(chr(39), chr(39)+chr(39))}',
+                        '{witness_statement.replace(chr(39), chr(39)+chr(39))}',
+                        'streamlit_user'
+                """).collect()
+                
+                # Insert into CLAIMS_LANDING and capture claim_id
+                new_claim_id = submit_claim_to_landing(
+                    policy_number, customer_id, claim_description,
+                    incident_date, claim_amount, 'AUTO', None
+                )
+                
+                st.success(f"✅ Auto claim submitted! Claim ID: **{new_claim_id}**")
+                st.info(f"📁 Police report: {'✅' if police_path else '—'} | Garage estimate: {'✅' if estimate_path else '—'}")
+                
+                if run_now:
+                    run_pipeline_and_show(new_claim_id)
+                else:
+                    st.caption("Claim is queued. Run `CALL INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM('" + str(new_claim_id) + "')` or use the Tasks automation.")
 
 
 # ============================================================
@@ -343,46 +409,58 @@ elif page == "🏠 Property/Fire Claim":
         run_now_prop = st.checkbox("⚡ Run AI pipeline immediately after submit", value=False, key="prop_run")
         submitted = st.form_submit_button("📤 Submit Property Claim", use_container_width=True)
         
-        if submitted and customer_id and claim_description:
-            # Upload documents
-            fire_path = None
-            if fire_report:
-                fire_path, size = upload_to_stage(fire_report, "EVIDENCE_STAGE", f"fire/{customer_id}")
-                register_document(None, None, customer_id, 'PROPERTY',
-                                'FIRE_INVESTIGATION_REPORT', fire_report.name, fire_path, size, 'streamlit_user')
-            
-            contractor_path = None
-            if contractor_estimate:
-                contractor_path, size = upload_to_stage(contractor_estimate, "DOCUMENTS_STAGE", f"property/{customer_id}")
-                register_document(None, None, customer_id, 'PROPERTY',
-                                'CONTRACTOR_ESTIMATE', contractor_estimate.name, contractor_path, size, 'streamlit_user')
-            
-            # Insert into PROPERTY_CLAIMS
-            session.sql(f"""
-                INSERT INTO RAW.PROPERTY_CLAIMS
-                    (customer_id, incident_date, claim_amount, damage_type,
-                     cause_of_loss, contractor_id, replacement_cost_claimed,
-                     claim_description, fire_investigation_report,
-                     contractor_repair_estimate, submitted_by)
-                SELECT
-                    '{customer_id}', '{incident_date}', {claim_amount}, '{damage_type}',
-                    '{cause_of_loss.replace(chr(39), chr(39)+chr(39))}', '{contractor_id}', {replacement_cost},
-                    '{claim_description.replace(chr(39), chr(39)+chr(39))}', '{fire_path or ""}',
-                    '{contractor_path or ""}', 'streamlit_user'
-            """).collect()
-            
-            # Insert into CLAIMS_LANDING and capture claim_id
-            new_claim_id = submit_claim_to_landing(
-                None, customer_id, claim_description,
-                incident_date, claim_amount, 'PROPERTY', None
-            )
-            
-            st.success(f"✅ Property claim submitted! Claim ID: **{new_claim_id}**")
-            
-            if run_now_prop:
-                run_pipeline_and_show(new_claim_id)
+        if submitted:
+            # --- DQ Validation ---
+            validation_errors = []
+            cust_ok, cust_msg = validate_customer(customer_id)
+            if not cust_ok:
+                validation_errors.append(cust_msg)
+            basic_errors = validate_claim_basics(claim_amount, incident_date, claim_description)
+            validation_errors.extend(basic_errors)
+
+            if validation_errors:
+                for err in validation_errors:
+                    st.error(f"❌ {err}")
             else:
-                st.caption("Claim queued. Run SP_PROCESS_CLAIM or use Tasks automation.")
+                # Upload documents
+                fire_path = None
+                if fire_report:
+                    fire_path, size = upload_to_stage(fire_report, "EVIDENCE_STAGE", f"fire/{customer_id}")
+                    register_document(None, None, customer_id, 'PROPERTY',
+                                    'FIRE_INVESTIGATION_REPORT', fire_report.name, fire_path, size, 'streamlit_user')
+                
+                contractor_path = None
+                if contractor_estimate:
+                    contractor_path, size = upload_to_stage(contractor_estimate, "DOCUMENTS_STAGE", f"property/{customer_id}")
+                    register_document(None, None, customer_id, 'PROPERTY',
+                                    'CONTRACTOR_ESTIMATE', contractor_estimate.name, contractor_path, size, 'streamlit_user')
+                
+                # Insert into PROPERTY_CLAIMS
+                session.sql(f"""
+                    INSERT INTO RAW.PROPERTY_CLAIMS
+                        (customer_id, incident_date, claim_amount, damage_type,
+                         cause_of_loss, contractor_id, replacement_cost_claimed,
+                         claim_description, fire_investigation_report,
+                         contractor_repair_estimate, submitted_by)
+                    SELECT
+                        '{customer_id}', '{incident_date}', {claim_amount}, '{damage_type}',
+                        '{cause_of_loss.replace(chr(39), chr(39)+chr(39))}', '{contractor_id}', {replacement_cost},
+                        '{claim_description.replace(chr(39), chr(39)+chr(39))}', '{fire_path or ""}',
+                        '{contractor_path or ""}', 'streamlit_user'
+                """).collect()
+                
+                # Insert into CLAIMS_LANDING and capture claim_id
+                new_claim_id = submit_claim_to_landing(
+                    None, customer_id, claim_description,
+                    incident_date, claim_amount, 'PROPERTY', None
+                )
+                
+                st.success(f"✅ Property claim submitted! Claim ID: **{new_claim_id}**")
+                
+                if run_now_prop:
+                    run_pipeline_and_show(new_claim_id)
+                else:
+                    st.caption("Claim queued. Run SP_PROCESS_CLAIM or use Tasks automation.")
 
 
 # ============================================================
@@ -431,50 +509,64 @@ elif page == "👷 Workers Comp Claim":
         
         submitted = st.form_submit_button("📤 Submit Workers Comp Claim", use_container_width=True)
         
-        if submitted and customer_id and employee_id and incident_description:
-            # Upload documents
-            medical_path = None
-            if medical_report:
-                medical_path, size = upload_to_stage(medical_report, "EVIDENCE_STAGE", f"medical/{employee_id}")
-                register_document(None, None, customer_id, 'WORKERS_COMP',
-                                'MEDICAL_REPORT', medical_report.name, medical_path, size, 'streamlit_user')
-            
-            rtw_path = None
-            if return_to_work:
-                rtw_path, size = upload_to_stage(return_to_work, "DOCUMENTS_STAGE", f"wc/{employee_id}")
-                register_document(None, None, customer_id, 'WORKERS_COMP',
-                                'RETURN_TO_WORK_PLAN', return_to_work.name, rtw_path, size, 'streamlit_user')
-            
-            # Insert into WORKERS_COMP_CLAIMS
-            session.sql(f"""
-                INSERT INTO RAW.WORKERS_COMP_CLAIMS
-                    (customer_id, employee_id, incident_date, injury_type,
-                     body_part_injured, claim_amount, days_lost,
-                     treating_physician_id, incident_description,
-                     employer_statement, medical_report, return_to_work_plan,
-                     submitted_by)
-                SELECT
-                    '{customer_id}', '{employee_id}', '{incident_date}', '{injury_type}',
-                    '{body_part}', {claim_amount}, {days_lost},
-                    '{treating_physician}',
-                    '{incident_description.replace(chr(39), chr(39)+chr(39))}',
-                    '{employer_statement.replace(chr(39), chr(39)+chr(39))}',
-                    '{medical_path or ""}',
-                    '{rtw_path or ""}', 'streamlit_user'
-            """).collect()
-            
-            # Insert into unified pipeline
-            session.sql(f"""
-                INSERT INTO RAW.CLAIMS_LANDING
-                    (customer_id, claim_text, incident_date,
-                     claimed_amount, lob_type, incident_location)
-                SELECT
-                    '{customer_id}',
-                    '{incident_description.replace(chr(39), chr(39)+chr(39))}',
-                     '{incident_date}', {claim_amount}, 'WORKERS_COMP', 'Workplace'
-            """).collect()
-            
-            st.success("✅ Workers Comp claim submitted!")
+        if submitted:
+            # --- DQ Validation ---
+            validation_errors = []
+            cust_ok, cust_msg = validate_customer(customer_id)
+            if not cust_ok:
+                validation_errors.append(cust_msg)
+            basic_errors = validate_claim_basics(claim_amount, incident_date, incident_description)
+            validation_errors.extend(basic_errors)
+            if not employee_id or not employee_id.strip():
+                validation_errors.append("Employee ID is required.")
+
+            if validation_errors:
+                for err in validation_errors:
+                    st.error(f"❌ {err}")
+            else:
+                # Upload documents
+                medical_path = None
+                if medical_report:
+                    medical_path, size = upload_to_stage(medical_report, "EVIDENCE_STAGE", f"medical/{employee_id}")
+                    register_document(None, None, customer_id, 'WORKERS_COMP',
+                                    'MEDICAL_REPORT', medical_report.name, medical_path, size, 'streamlit_user')
+                
+                rtw_path = None
+                if return_to_work:
+                    rtw_path, size = upload_to_stage(return_to_work, "DOCUMENTS_STAGE", f"wc/{employee_id}")
+                    register_document(None, None, customer_id, 'WORKERS_COMP',
+                                    'RETURN_TO_WORK_PLAN', return_to_work.name, rtw_path, size, 'streamlit_user')
+                
+                # Insert into WORKERS_COMP_CLAIMS
+                session.sql(f"""
+                    INSERT INTO RAW.WORKERS_COMP_CLAIMS
+                        (customer_id, employee_id, incident_date, injury_type,
+                         body_part_injured, claim_amount, days_lost,
+                         treating_physician_id, incident_description,
+                         employer_statement, medical_report, return_to_work_plan,
+                         submitted_by)
+                    SELECT
+                        '{customer_id}', '{employee_id}', '{incident_date}', '{injury_type}',
+                        '{body_part}', {claim_amount}, {days_lost},
+                        '{treating_physician}',
+                        '{incident_description.replace(chr(39), chr(39)+chr(39))}',
+                        '{employer_statement.replace(chr(39), chr(39)+chr(39))}',
+                        '{medical_path or ""}',
+                        '{rtw_path or ""}', 'streamlit_user'
+                """).collect()
+                
+                # Insert into unified pipeline
+                session.sql(f"""
+                    INSERT INTO RAW.CLAIMS_LANDING
+                        (customer_id, claim_text, incident_date,
+                         claimed_amount, lob_type, incident_location)
+                    SELECT
+                        '{customer_id}',
+                        '{incident_description.replace(chr(39), chr(39)+chr(39))}',
+                         '{incident_date}', {claim_amount}, 'WORKERS_COMP', 'Workplace'
+                """).collect()
+                
+                st.success("✅ Workers Comp claim submitted!")
 
 
 # ============================================================

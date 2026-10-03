@@ -16,3 +16,8 @@ entities:
       schema: PROCESSED
       name: CUSTOMER360_DASHBOARD
     title: customer360-dashboard
+    run_mode: SpcsOnly
+    execute_as: OWNER
+    sharing:
+      - role: ACCOUNTADMIN
+        with_grant_option: true

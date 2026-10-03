@@ -8,7 +8,7 @@ LANGUAGE SQL
 AS
 $$
     SELECT SNOWFLAKE.CORTEX.COMPLETE(
-        'mistral-large2',
+        'llama3.3-70b',
         CONCAT('Classify into one LOB. Reply with ONLY: AUTO or PROPERTY or WORKERS_COMP\n\nClaim: ', LEFT(claim_text, 1000))
     )
 $$;
