@@ -1,14 +1,9 @@
 manifest_version: 2
 type: DCM_PROJECT
-default_target: 'DEV'
+default_target: 'PROD'
 
 targets:
-  DEV:
-    account_identifier: RMCYMCI-AF72128
+  PROD:
+    account_identifier: 'DWUWNER-SV41742'
     project_name: 'INSURANCE_DB.RAW.INSURANCE_DCM_PROJECT'
     project_owner: ACCOUNTADMIN
-
-  PROD:
-    account_identifier: '<TARGET_ACCOUNT_IDENTIFIER>'
-    project_name: 'INSURANCE_DB.RAW.INSURANCE_DCM_PROJECT'
-    project_owner: '<TARGET_DEPLOYER_USERNAME>'
