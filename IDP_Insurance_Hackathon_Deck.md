@@ -70,23 +70,24 @@
 │             │  └─Resolution    │  Churn Propensity │ NBA Chatbot      │
 │ 3 LOBs:     │                  │  Scoring Model    │ (Cortex AI)      │
 │ Auto        │  Churn Pipeline: │                   │                   │
-│ Home        │  ┌─Scan          │  9 Aggregation    │ IDP Landing      │
-│ Life        │  ├─Root Cause    │  Views            │ Page + Test      │
+│ Property    │  ┌─Scan          │  9 Aggregation    │ IDP Landing      │
+│ Workers Comp│  ├─Root Cause    │  Views            │ Page + Test      │
 │             │  └─NBA Gen       │                   │ Suite            │
-│ 5 Internal  │                  │                   │                   │
-│ Stages      │  Cortex AI:      │                   │                   │
-│ (Documents) │  COMPLETE         │                   │                   │
-│             │  CLASSIFY_TEXT   │                   │                   │
-│             │  SENTIMENT       │                   │                   │
+│             │  Cortex AI:      │                   │                   │
+│ 5 Internal  │  COMPLETE        │                   │                   │
+│ Stages      │  CLASSIFY_TEXT   │                   │                   │
+│ (Documents) │  SENTIMENT       │                   │                   │
 │             │  EMBED_TEXT_768  │                   │                   │
 │             │  PARSE_DOCUMENT  │                   │                   │
+│             │  SEARCH_PREVIEW  │                   │                   │
+│             │  SUMMARIZE       │                   │                   │
 └─────────────┴──────────────────┴───────────────────┴───────────────────┘
 ```
 
 **Bottom stats bar (gold on dark):**
 
-| 41 Tables | 9 Views | 14 Procedures | 5 AI Agents | 4 Streamlit Apps | 5 Internal Stages |
-|---|---|---|---|---|---|
+| 31 Tables | 9 Views | 21 Procedures | 4 UDFs | 5 AI Agents | 8 Tasks | 5 Streams | 4 Streamlit Apps | 5 Internal Stages |
+|---|---|---|---|---|---|---|---|---|
 
 ---
 
@@ -126,7 +127,7 @@
 
 **App 1 (top-left) — "Claims & Policy Intake Portal":**
 - 3 LOB-specific claim forms: Auto, Property, Workers Comp
-- 3 policy application forms per LOB
+- 3 LOB-specific policy application forms: Auto, Property, Workers Comp
 - Document upload to Snowflake Internal Stage
 - Real-time DQ validation (customer exists, policy active, LOB match, coverage limits)
 - One-click AI pipeline trigger per claim
@@ -167,9 +168,13 @@
 
 4. **Production-Grade Testing** — 13-test integration suite embedded in the IDP landing page. Tests every app's data flow end-to-end with automatic cleanup. No separate test infra needed.
 
-5. **AI at Every Layer** — Cortex `COMPLETE` for reasoning, `CLASSIFY_TEXT` for severity, `SENTIMENT` for interaction analysis, `PARSE_DOCUMENT` for OCR, `EMBED_TEXT_768` for semantic search, vector cosine similarity for fraud detection.
+5. **AI at Every Layer** — Cortex `COMPLETE` for reasoning, `CLASSIFY_TEXT` for severity, `SENTIMENT` for interaction analysis, `PARSE_DOCUMENT` for OCR, `EMBED_TEXT_768` for semantic search, `SEARCH_PREVIEW` for RAG retrieval, `SUMMARIZE` for claim summaries, vector cosine similarity for fraud detection.
 
 6. **DCM (Database Change Management)** — Full infrastructure-as-code with `manifest.yml`, rendering pipeline, and reproducible deployments.
+
+7. **Event-Driven Automation** — 8 Snowflake Tasks + 5 Streams form a DAG: new claims auto-trigger the 5-agent pipeline, new applications auto-trigger underwriting, and daily CRON jobs run churn scan → root cause → NBA generation. Health-check task monitors stuck claims every 3 hours.
+
+8. **3-Step Underwriting Pipeline** — `SP_UW_RISK_SCORE` computes actuarial risk tier, `SP_UW_GUIDELINE_LOOKUP` retrieves regulatory guidelines via Cortex Search, `SP_UW_DECISION` makes auto-approve/refer decisions with premium recommendation.
 
 **Closing Statement (centered, gold text):**
 
@@ -186,12 +191,17 @@
 | Category | Count | Details |
 |---|---|---|
 | **Database** | INSURANCE_DB | 4 schemas: RAW, PROCESSED, RESULTS, VECTORS |
-| **RAW Tables** | 22 | Customers, Policies, Claims (3 LOBs), Payments, Interactions, Providers, Applications (3 LOBs), Document Registry |
-| **PROCESSED Tables** | 5 | FCT_CUSTOMER_360, DT_CUSTOMER_360, CLAIM_STATE, CHURN_ALERTS, NEXT_BEST_ACTIONS |
-| **Views** | 9 | 5 aggregation views, V_CHURN_DASHBOARD, V_PIPELINE_STATUS, V_NBA_FOR_CRM, FCT_CUSTOMER_360_VIEW |
-| **Stored Procedures** | 14 | 5 Agent SPs, SP_BUILD_CUSTOMER_360, SP_PROCESS_CLAIM, SP_CHURN_PIPELINE_FULL, SP_GENERATE_RETENTION_NBA, + more |
+| **RAW Tables** | 22 | Customers, Policies, Claims Landing, Claims (3 LOBs: Auto/Property/Workers Comp), Applications (3 LOBs), Payments, Interactions, Providers, Fraud Indicators, Underwriting Guidelines, Actuarial Tables, Retention Playbooks, Documents, Document Registry, Police Reports, Geographic Risk, Credit Bureau, Policy Applications (3 LOBs) |
+| **PROCESSED Tables** | 4 | FCT_CUSTOMER_360, CLAIM_STATE, CHURN_ALERTS, NEXT_BEST_ACTIONS |
+| **RESULTS Tables** | 3 | RESOLUTIONS, UNDERWRITING_DECISIONS, AUDIT_LOG |
+| **VECTORS Tables** | 2 | DOCUMENT_CHUNKS, FRAUD_PATTERN_EMBEDDINGS |
+| **Views** | 9 | 5 aggregation views (Policy Portfolio, Claims History, Payment Behavior, Interaction Signals, Embedding Features), V_CHURN_DASHBOARD, V_PIPELINE_STATUS, V_NBA_FOR_CRM, FCT_CUSTOMER_360_VIEW |
+| **Stored Procedures** | 21 | 5 Agent SPs, SP_PROCESS_CLAIM, SP_PROCESS_ALL_CLAIMS, SP_DQ_VALIDATE_CLAIM, SP_BUILD_CUSTOMER_360, SP_CHURN_SCAN, SP_CHURN_ROOT_CAUSE, SP_GENERATE_RETENTION_NBA, SP_CHURN_PIPELINE_FULL, SP_EXTRACT_INTERACTION_FEATURES, SP_EXTRACT_UNSTRUCTURED_FEATURES_BATCH, SP_PROCESS_UPLOADED_DOCUMENT, SP_PROCESS_ALL_PENDING_DOCUMENTS, SP_UW_RISK_SCORE, SP_UW_GUIDELINE_LOOKUP, SP_UW_DECISION, SP_PROCESS_APPLICATION |
 | **Stages** | 5 | DOCUMENTS_STAGE, EVIDENCE_STAGE, POLICY_DOCS_STAGE, KNOWLEDGE_BASE_STAGE, SEMANTIC_MODELS_STAGE |
 | **Streamlit Apps** | 4 | Claims Intake, Customer 360 Dashboard, NBA Chatbot, IDP Landing |
-| **Cortex AI Functions** | 6 | COMPLETE, CLASSIFY_TEXT, SENTIMENT, PARSE_DOCUMENT, EMBED_TEXT_768, Vector Cosine Similarity |
-| **Dynamic Tables** | 1 | DT_CUSTOMER_360 (hourly refresh, FULL mode) |
-| **UDFs** | 1 | COMPUTE_FRAUD_SIMILARITY (vector-based) |
+| **Cortex AI Functions** | 8 | COMPLETE, CLASSIFY_TEXT, SENTIMENT, PARSE_DOCUMENT, EMBED_TEXT_768, SEARCH_PREVIEW, SUMMARIZE, Vector Cosine Similarity |
+| **Dynamic Tables** | 1 | DT_CUSTOMER_360 (hourly refresh, TARGET_LAG = 1 hour) |
+| **UDFs** | 4 | CLASSIFY_LOB, CLAIM_SENTIMENT, SUMMARIZE_CLAIM, COMPUTE_FRAUD_SIMILARITY |
+| **Streams** | 5 | CLAIMS_LANDING_STREAM, INTERACTIONS_STREAM, APPLICATIONS_STREAM, PAYMENTS_STREAM, RESOLUTIONS_STREAM |
+| **Tasks** | 8 | TASK_CLAIMS_ORCHESTRATOR, TASK_UNDERWRITING_ORCHESTRATOR, TASK_EXTRACT_UNSTRUCTURED_FEATURES, TASK_CHURN_SCAN, TASK_CHURN_NBA, TASK_POST_DECISION_ACTIONS, TASK_REFRESH_EMBEDDINGS, TASK_HEALTH_CHECK |
+| **Warehouses** | 3 | AGENT_WH (Medium), EVAL_WH (X-Small), INGEST_WH (Small) |

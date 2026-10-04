@@ -1,0 +1,52 @@
+GARAGE REPAIR ESTIMATE
+========================================================
+AutoFix Collision Center
+Network Provider ID: PROV-001
+License: LIC-MH-4421
+Date: 2024-08-11
+
+CUSTOMER: Ananya Sharma
+VEHICLE: Hyundai Creta 2022, White (MH-02-CK-4488)
+POLICY: POL-001 (IDP Insurance)
+CLAIM REF: CLM-001
+
+DAMAGE INSPECTION SUMMARY
+Inspection Date: 2024-08-11
+Inspector: Mechanic Vikram Patil
+
+PARTS REQUIRED
+| Part | OEM Part No. | Qty | Unit Price | Total |
+|------|-------------|-----|-----------|-------|
+| Rear Bumper Cover | 86611-S1000 | 1 | 1,800 | 1,800 |
+| Left Tail Lamp Assy | 92401-S1100 | 1 | 1,000 | 1,000 |
+| Bumper Bracket (L) | 86613-S1000 | 1 | 250 | 250 |
+| Bumper Bracket (R) | 86614-S1000 | 1 | 250 | 250 |
+
+LABOR
+| Description | Hours | Rate | Total |
+|-------------|-------|------|-------|
+| Bumper remove/install | 1.5 | 300 | 450 |
+| Tail lamp replace | 0.5 | 300 | 150 |
+| Paint (color match) | 2.0 | 200 | 400 |
+| Quality check | 0.5 | 200 | 100 |
+
+SUMMARY
+Parts Total:    INR 3,300
+Labor Total:    INR 1,100
+GST (18%):      INR   100 (rounded)
+---------------------------------
+GRAND TOTAL:    INR 4,500
+
+ESTIMATED COMPLETION: 3 working days from approval
+WARRANTY: 6 months on parts and labor
+
+Notes:
+- No structural damage to chassis
+- No airbag deployment
+- Vehicle is drivable
+- OEM parts used throughout
+
+Authorized by: Sunil Verma, Service Manager
+AutoFix Collision Center, Andheri West, Mumbai
+Phone: 022-2631-XXXX
+========================================================

@@ -160,14 +160,19 @@ SELECT * FROM VALUES
     ('ACT-015','HOME','LOW','BANGALORE_METRO',0.018,1.0,1.20,1.0,'2024-01-01','2025-12-31');
 
 -- ============================================================================
--- 10. CHURN_ALERTS (seed 4 historical alerts)
+-- 10. CHURN_ALERTS (seed 4 alerts with CURRENT_DATE for fresh expiry)
 -- ============================================================================
 INSERT INTO INSURANCE_DB.PROCESSED.CHURN_ALERTS (CUSTOMER_ID, ALERT_DATE, CHURN_PROPENSITY, SENTIMENT_SCORE, COMPLAINT_COUNT, TRIGGER_REASON, ROOT_CAUSE, PRIORITY, STATUS)
-SELECT * FROM VALUES
-    ('CUST-006','2024-10-02',0.6,NULL,0,'New customer with pending policy, no engagement after onboarding',NULL,4,'NEW'),
-    ('CUST-005','2024-10-01',0.45,NULL,0,'Large open claim under review, follow-up pending on fire damage',NULL,3,'NEW'),
-    ('CUST-004','2024-09-25',0.82,NULL,0,'Multiple late payments, escalated billing complaint, low NPS scores',NULL,1,'NEW'),
-    ('CUST-008','2024-09-20',0.75,NULL,0,'Lapsed home policy, denied claim, expressed frustration in recent interaction',NULL,2,'NEW');
+SELECT 'CUST-006', CURRENT_DATE(), 0.6, NULL, 0, 'New customer with pending policy, no engagement after onboarding', NULL, 4, 'NEW'
+UNION ALL SELECT 'CUST-005', CURRENT_DATE(), 0.45, NULL, 0, 'Large open claim under review, follow-up pending on fire damage', NULL, 3, 'NEW'
+UNION ALL SELECT 'CUST-004', CURRENT_DATE(), 0.82, NULL, 0, 'Multiple late payments, escalated billing complaint, low NPS scores', NULL, 1, 'NEW'
+UNION ALL SELECT 'CUST-008', CURRENT_DATE(), 0.75, NULL, 0, 'Lapsed home policy, denied claim, expressed frustration in recent interaction', NULL, 2, 'NEW';
+
+-- ============================================================================
+-- 11. APPLICATIONS (1 seed application for UW pipeline)
+-- ============================================================================
+INSERT INTO INSURANCE_DB.RAW.APPLICATIONS (APPLICATION_ID, APPLICANT_NAME, LOB_TYPE, COVERAGE_REQUESTED, CREDIT_SCORE, GEOGRAPHIC_ZONE, EXISTING_CUSTOMER_ID, STATUS, SUBMISSION_DATE)
+SELECT 'APP-001', 'Ananya Sharma', 'AUTO', 500000, 780, 'CHENNAI_GENERAL', 'CUST-001', 'PENDING', CURRENT_TIMESTAMP();
 
 -- ============================================================================
 -- SEED DATA COMPLETE

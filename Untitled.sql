@@ -1,23 +1,21 @@
--- Find the claim you just submitted
-SELECT claim_id, customer_id, lob_type, claimed_amount, claim_status, submission_date
-FROM INSURANCE_DB.RAW.CLAIMS_LANDING
-WHERE customer_id = 'CUST001' AND lob_type = 'AUTO'
-ORDER BY submission_date DESC
-LIMIT 3;
-
--- Run the pipeline (paste the claim_id)
-CALL INSURANCE_DB.PROCESSED.SP_PROCESS_CLAIM('62ff9fbe-3eda-46fd-afe9-548ddd0b9c72');
-
--- View the decision
-SELECT decision, settlement_amount, fraud_risk_level, confidence_score, reasoning_summary
-FROM INSURANCE_DB.RESULTS.RESOLUTIONS
-WHERE claim_id = '62ff9fbe-3eda-46fd-afe9-548ddd0b9c72'
-ORDER BY decided_at DESC LIMIT 1;
-
-SELECT *
-FROM INSURANCE_DB.VECTORS.FRAUD_PATTERN_EMBEDDINGS
-
-
-ORDER BY severity;
-
-select * from claims_landing
+DECLARE
+    full_name VARCHAR;
+    c CURSOR FOR SELECT "database_name", "schema_name", "name" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()));
+BEGIN
+    SHOW DBT PROJECTS IN ACCOUNT;
+    -- To migrate only in a specific database, comment out the line above and uncomment the following:
+    -- SHOW DBT PROJECTS IN DATABASE <database_name>;
+    OPEN c;
+    FOR row_var IN c DO
+        full_name := '"' || row_var."database_name" || '"."' || row_var."schema_name" || '"."' || row_var."name" || '"';
+        BEGIN
+            SELECT SYSTEM$MIGRATE_DBT_PROJECT(:full_name);
+            SYSTEM$LOG_INFO('Migrated: ' || :full_name);
+        EXCEPTION
+            WHEN OTHER THEN
+                SYSTEM$LOG_INFO('Failed: ' || :full_name || ' - ' || SQLERRM);
+        END;
+    END FOR;
+    CLOSE c;
+    RETURN 'Migration complete.';
+END;
