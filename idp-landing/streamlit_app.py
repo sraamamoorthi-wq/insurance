@@ -327,14 +327,25 @@ def render_claims():
                         st.info(f":material/content_copy: **Claim ID: {new_claim_id}** — use this to track your claim or upload additional documents.")
 
                         if claim_uploaded:
-                            session.file.put_stream(claim_uploaded, stage_path, auto_compress=False, overwrite=True)
-                            session.sql(
-                                "INSERT INTO INSURANCE_DB.RAW.DOCUMENT_REGISTRY "
-                                "(DOCUMENT_ID, CLAIM_ID, DOCUMENT_TYPE, FILE_NAME, STAGE_PATH) "
-                                "VALUES (:1, :2, :3, :4, :5)",
-                                params=[doc_id, new_claim_id, claim_doc_type, claim_uploaded.name, stage_path],
-                            ).collect()
-                            st.success(f"Document **{doc_id}** ({claim_uploaded.name}) attached to claim {new_claim_id}")
+                            try:
+                                session.file.put_stream(claim_uploaded, stage_path, auto_compress=False, overwrite=True)
+                                session.sql(
+                                    "INSERT INTO INSURANCE_DB.RAW.DOCUMENT_REGISTRY "
+                                    "(DOCUMENT_ID, CLAIM_ID, DOCUMENT_TYPE, FILE_NAME, STAGE_PATH) "
+                                    "VALUES (:1, :2, :3, :4, :5)",
+                                    params=[doc_id, new_claim_id, claim_doc_type, claim_uploaded.name, stage_path],
+                                ).collect()
+                                st.success(f"Document **{doc_id}** ({claim_uploaded.name}) attached to claim {new_claim_id}")
+                                # Silent parse — extract text and embed
+                                try:
+                                    session.sql(
+                                        "CALL INSURANCE_DB.RAW.SP_PROCESS_UPLOADED_DOCUMENT(:1)",
+                                        params=[doc_id],
+                                    ).collect()
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
 
                     except Exception as e:
                         st.error(f"Submission failed: {e}")
@@ -440,6 +451,14 @@ def render_claims():
                         params=[doc_id, doc_claim_id.strip(), doc_type, uploaded.name, stage_path],
                     ).collect()
                     st.success(f"Document {doc_id} uploaded to {stage_path}")
+                    # Silent parse
+                    try:
+                        session.sql(
+                            "CALL INSURANCE_DB.RAW.SP_PROCESS_UPLOADED_DOCUMENT(:1)",
+                            params=[doc_id],
+                        ).collect()
+                    except Exception:
+                        pass
                 except Exception as e:
                     st.error(f"Upload failed: {e}")
 
