@@ -1,6 +1,7 @@
 # Insurance Claims Agentic AI Platform — Complete Documentation
 
 ## Table of Contents
+0. [Start Here: End-to-End Data Flow (Beginner's Guide)](#0-start-here-end-to-end-data-flow-beginners-guide)
 1. [Project Overview](#1-project-overview)
 2. [Architecture](#2-architecture)
 3. [Directory Structure](#3-directory-structure)
@@ -21,6 +22,377 @@
 18. [Integration Test Suite](#18-integration-test-suite)
 19. [Churn Propensity Scoring Model](#19-churn-propensity-scoring-model)
 20. [Known Issues and Future Work](#20-known-issues-and-future-work)
+
+---
+
+## 0. Start Here: End-to-End Data Flow (Beginner's Guide)
+
+This section explains the whole platform in plain language. You do not need to know Snowflake beforehand. Read it top to bottom once and the rest of this document will make sense.
+
+### 0.1 Five words you need to know first
+
+| Term | Plain-English meaning | Analogy |
+|------|----------------------|---------|
+| **Table** | Where data is stored, in rows and columns | A spreadsheet tab |
+| **Stream** | A "change tracker" on a table. It remembers which rows are new since the last time someone looked | A "new mail" badge on an inbox |
+| **Task** | A scheduled job. It wakes up on a timer (e.g. every 1 minute) and runs some work, optionally only if a stream has new rows | An alarm clock that checks the inbox |
+| **Stored Procedure (SP)** | A saved program that runs inside Snowflake. In this project, each "AI agent" is a stored procedure | A worker who follows a written checklist |
+| **Cortex AI** | Snowflake's built-in AI functions: `COMPLETE` (ask an LLM a question), `CLASSIFY_TEXT`, `SENTIMENT`, `EMBED_TEXT_768` (turn text into numbers for similarity search), `PARSE_DOCUMENT` (read a PDF), and **Cortex Search** (look up relevant reference documents) | A smart assistant the worker can consult |
+
+> **What is an "agent" here?** An agent is simply a stored procedure that does one focused job (e.g. "check for fraud"), uses Cortex AI to reason about the data, writes its answer down, and hands off to the next agent. Five agents in a row form the claims "pipeline", like an assembly line.
+
+### 0.2 The big picture (one diagram)
+
+```
+                         ┌──────────────────────────────────────────┐
+                         │      IDP LANDING PAGE  (Streamlit app)    │
+                         │      idp-landing/streamlit_app.py         │
+                         └──────────────────────────────────────────┘
+                             │              │              │            │
+            ┌────────────────┘              │              │            └───────────────┐
+            ▼                               ▼              ▼                            ▼
+ ┌─────────────────────┐   ┌──────────────────────┐  ┌──────────────────┐   ┌──────────────────────┐
+ │ A. New Claim form   │   │ B. Policy Application│  │ C. Document      │   │ D. Intelligent Chat  │
+ │                     │   │    form              │  │    Upload        │   │  (Agent / Customer)  │
+ └─────────────────────┘   └──────────────────────┘  └──────────────────┘   └──────────────────────┘
+            │                          │                      │                        │
+            ▼                          ▼                      ▼                        ▼
+   RAW.CLAIMS_LANDING     RAW.AUTO_ / PROPERTY_ /     RAW.DOCUMENTS_STAGE        Cortex COMPLETE
+   (+ DOCUMENT_REGISTRY)  WORKERS_COMP_POLICY_        (file)  +                  (answer shown on
+            │             APPLICATIONS                RAW.DOCUMENT_REGISTRY       screen) and
+            │                          │              (row, status=PENDING)      RAW.INTERACTIONS
+            ▼                          ▼                      │                  (chat logged)
+  ┌───────────────────┐   ┌──────────────────────┐            ▼                        │
+  │ CLAIMS PIPELINE   │   │ UNDERWRITING PIPELINE│   ┌──────────────────┐            │
+  │ 5 AI agents       │   │ 3 steps              │   │ DOCUMENT PIPELINE│            │
+  │ (section 0.4)     │   │ (section 0.5)        │   │ PARSE + EMBED    │            │
+  └───────────────────┘   └──────────────────────┘   │ (section 0.6)    │            │
+            │                          │              └──────────────────┘            │
+            ▼                          ▼                                              │
+   RESULTS.RESOLUTIONS     PROCESSED.UNDERWRITING_                                    │
+   (decision)              DECISIONS                                                  │
+            │                                                                         │
+            └──────────────────────────────┬──────────────────────────────────────────┘
+                                           ▼
+            ┌──────────────────────────────────────────────────────────────┐
+            │ CUSTOMER 360  (one row per customer, ~60 features)           │
+            │ PROCESSED.DT_CUSTOMER_360 (auto-refresh ≤ 1 hour)             │
+            │ PROCESSED.FCT_CUSTOMER_360 (scored table used by the app)     │
+            └──────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼  daily 6 AM UTC
+            ┌──────────────────────────────────────────────────────────────┐
+            │ CHURN & RETENTION PIPELINE  (section 0.7)                    │
+            │ → PROCESSED.CHURN_ALERTS → PROCESSED.NEXT_BEST_ACTIONS        │
+            └──────────────────────────────────────────────────────────────┘
+                                           │
+                                           ▼
+            Back to the IDP Landing Page: Customer 360 dashboard + Chat side panel
+```
+
+### 0.3 Where data lives (the four "schemas")
+
+Think of `INSURANCE_DB` as a filing cabinet with four drawers:
+
+| Drawer (schema) | What goes in it | Examples |
+|-----------------|-----------------|----------|
+| `RAW` | Data exactly as it arrived from users or source systems | `CUSTOMERS`, `POLICIES`, `CLAIMS_LANDING`, `PAYMENTS`, `INTERACTIONS`, `DOCUMENT_REGISTRY` |
+| `PROCESSED` | Work-in-progress and derived data created by the agents | `CLAIM_STATE`, `FCT_CUSTOMER_360`, `CHURN_ALERTS`, `NEXT_BEST_ACTIONS` |
+| `RESULTS` | Final outcomes and the audit trail | `RESOLUTIONS`, `AUDIT_LOG` |
+| `VECTORS` | Text converted to numbers for "find similar" searches | `FRAUD_PATTERN_EMBEDDINGS` |
+
+### 0.4 Journey of a claim (step by step)
+
+**Example:** Ananya (CUST-001) is rear-ended on MG Road and files an AUTO claim for 4,500 on policy POL-001.
+
+**Step 1 — The user fills in the form** (Landing page → *Claims & Policy Intake* → *New Claim*).
+
+**Step 2 — The app checks the basics before saving** (front-end data-quality checks):
+
+| Check | If it fails |
+|-------|-------------|
+| Customer ID exists in `RAW.CUSTOMERS` | ❌ Blocked |
+| Policy ID exists in `RAW.POLICIES` | ❌ Blocked |
+| Policy belongs to this customer | ❌ Blocked |
+| Policy status is `ACTIVE` or `RENEWAL_PENDING` | ❌ Blocked |
+| Claim line of business matches the policy's | ⚠️ Warning only |
+| Claimed amount ≤ coverage limit | ⚠️ Warning only |
+
+**Step 3 — The claim is saved.** A new row goes into `RAW.CLAIMS_LANDING` with status `SUBMITTED` and a generated ID like `CLM-341FC5`. If a file was attached, it is uploaded to `@RAW.DOCUMENTS_STAGE/<claim_id>/` and recorded in `RAW.DOCUMENT_REGISTRY`.
+
+**Step 4 — Snowflake notices the new claim automatically.**
+- `RAW.CLAIMS_LANDING_STREAM` marks the row as "new".
+- Every minute, `PROCESSED.TASK_CLAIMS_ORCHESTRATOR` wakes up and asks: *"does the stream have new rows?"* If yes, it calls `SP_PROCESS_ALL_CLAIMS`, which picks up to 20 `SUBMITTED` claims.
+- **Data-quality gate:** for each claim, `SP_DQ_VALIDATE_CLAIM` re-checks the same rules as the form, plus a duplicate check (same customer + LOB within 30 days). If there are errors, the claim is marked `DQ_FAILED`, logged, and skipped. If it passes, `SP_PROCESS_CLAIM` runs the five agents.
+
+**Step 5 — Five agents process the claim, one after another** (each writes its result into `PROCESSED.CLAIM_STATE` and a line into `RESULTS.AUDIT_LOG`):
+
+```
+ CLAIMS_LANDING row (SUBMITTED)
+        │
+        ▼
+ ┌──────────────┐  "How serious is this?"
+ │ 1. INTAKE    │  Cortex CLASSIFY_TEXT reads the description → low / medium / high / critical
+ └──────────────┘  (if AI fails: assumes "medium")
+        │
+        ▼
+ ┌──────────────┐  "Is the policy valid for this claim?"
+ │ 2. VALIDATION│  Plain SQL rules: policy status, LOB match, coverage limit
+ └──────────────┘  (no AI needed — these are hard facts)
+        │
+        ▼
+ ┌──────────────┐  "Does this look like fraud?"
+ │ 3. FRAUD     │  • Cortex Search finds similar known fraud patterns
+ └──────────────┘  • Vector similarity vs VECTORS.FRAUD_PATTERN_EMBEDDINGS
+        │          • Cortex SENTIMENT on the text
+        │          • Cortex COMPLETE (llama3.1-8b) combines it all → fraud score 0–1
+        ▼
+ ┌──────────────┐  "How much should we pay?"
+ │ 4. ASSESSMENT│  Cortex Search pulls underwriting guidelines; Cortex COMPLETE recommends
+ └──────────────┘  a settlement amount (if AI fails: 85% of claimed amount)
+        │
+        ▼
+ ┌──────────────┐  "Final decision"
+ │ 5. RESOLUTION│  Fraud > 0.7 → REFERRED   |  policy invalid → DENIED
+ └──────────────┘  Fraud 0.4–0.7 → PARTIALLY_APPROVED  |  otherwise → APPROVED
+        │          Cortex COMPLETE writes a human-readable explanation
+        ▼
+ RESULTS.RESOLUTIONS  (decision + settlement amount + reasoning)
+```
+
+**Step 6 — After the decision.** `RESULTS.RESOLUTIONS_STREAM` sees the new decision; every minute `RESULTS.TASK_POST_DECISION_ACTIONS` writes a final "notification sent" entry (step 99) to `AUDIT_LOG`.
+
+**Step 7 — You see it in the app.** Landing page → *Customer 360* → *AI Pipeline Monitor* shows the claim in `V_PIPELINE_STATUS`, the decision in *Recent Resolutions*, and each agent's step, model and latency in the *Claims Audit Log*.
+
+**Safety nets**
+- Every AI call is wrapped in TRY/CATCH. If the LLM returns junk, a rule-based fallback is used, so a claim never gets stuck because of the AI.
+- `PROCESSED.TASK_HEALTH_CHECK` (every 3 hours) marks any claim stuck for more than 5 minutes as `FAILED` and moves it to `MANUAL_REVIEW` for a human.
+
+### 0.5 Journey of a policy application (underwriting)
+
+**What the app does:** Landing page → *Claims & Policy Intake* → *Policy Application* saves the form into one of three LOB tables, with status `PENDING`:
+`RAW.AUTO_POLICY_APPLICATIONS`, `RAW.PROPERTY_POLICY_APPLICATIONS`, or `RAW.WORKERS_COMP_POLICY_APPLICATIONS`.
+
+**What the pipeline does:** The underwriting pipeline is triggered by `RAW.APPLICATIONS_STREAM` on the generic `RAW.APPLICATIONS` table. `PROCESSED.TASK_UNDERWRITING_ORCHESTRATOR` checks every minute and calls `SP_PROCESS_APPLICATION` for up to 10 `PENDING` applications:
+
+```
+ RAW.APPLICATIONS row (PENDING)
+        │
+        ▼
+ 1. SP_UW_RISK_SCORE       Credit score → risk tier (LOW / MEDIUM / HIGH),
+                           actuarial table lookup, 10% existing-customer discount
+        ▼
+ 2. SP_UW_GUIDELINE_LOOKUP Cortex Search returns the top 3 underwriting guidelines
+                           for this LOB + risk tier
+        ▼
+ 3. SP_UW_DECISION         LOW → auto-approve | MEDIUM → manual review |
+                           HIGH → senior underwriter, premium × 1.5
+        ▼
+ PROCESSED.UNDERWRITING_DECISIONS  +  APPLICATIONS.status updated  +  AUDIT_LOG
+```
+
+> ⚠️ **Gap to be aware of:** in the current definitions there is no stream or task that moves rows from the three LOB application tables into `RAW.APPLICATIONS`. Applications submitted from the IDP Landing page are therefore stored, but they do not automatically start the underwriting pipeline. See [Known Issues](#20-known-issues-and-future-work).
+
+### 0.6 Journey of an uploaded document
+
+1. Landing page → *Document Upload* (or a file attached to a new claim).
+2. The file is stored in `@INSURANCE_DB.RAW.DOCUMENTS_STAGE/<claim_id>/` (a "stage" is Snowflake's file storage folder).
+3. A row is added to `RAW.DOCUMENT_REGISTRY` (`extraction_status = PENDING`).
+4. `RAW.SP_PROCESS_ALL_PENDING_DOCUMENTS` calls `RAW.SP_PROCESS_UPLOADED_DOCUMENT` for each pending file:
+   - **Cortex PARSE_DOCUMENT** reads the PDF/image and extracts its text.
+   - **Cortex EMBED_TEXT_768** turns the text into a vector so it can be searched by meaning.
+   - Status becomes `EXTRACTED` (or `FAILED` if nothing could be read).
+
+> ⚠️ **Note:** no task currently schedules `SP_PROCESS_ALL_PENDING_DOCUMENTS`; it must be run manually (`CALL INSURANCE_DB.RAW.SP_PROCESS_ALL_PENDING_DOCUMENTS();`).
+
+### 0.7 Customer 360 and the churn & retention pipeline
+
+**Customer 360 = one summary row per customer.** Four aggregation views each summarise one topic, and a Dynamic Table joins them:
+
+```
+ RAW.POLICIES      → V_AGG_POLICY_PORTFOLIO    (premium, renewals, lapses)      ┐
+ RAW.CLAIMS_LANDING→ V_AGG_CLAIMS_HISTORY      (claim counts, amounts, approvals)│
+ RAW.PAYMENTS      → V_AGG_PAYMENT_BEHAVIOR    (delays, missed payments)         ├─► PROCESSED.DT_CUSTOMER_360
+ RAW.INTERACTIONS  → V_AGG_INTERACTION_SIGNALS (sentiment, complaints, NPS)      ┘   (Dynamic Table: refreshes
+ RAW.CUSTOMERS  ─────────────────────────────────────────────────────────────────►    itself within 1 hour)
+                                                                                         │
+                                                                                         ▼
+                                                                          PROCESSED.FCT_CUSTOMER_360
+                                                                          (+ churn propensity score,
+                                                                             used by the dashboard & chat)
+```
+
+> A **Dynamic Table** is a table defined by a query that Snowflake keeps up to date automatically — you never have to "rebuild" it by hand.
+
+**Daily churn pipeline** (a chain of three tasks, starting 6 AM UTC):
+
+```
+ TASK_EXTRACT_UNSTRUCTURED_FEATURES  → SP_EXTRACT_UNSTRUCTURED_FEATURES_BATCH
+   Cortex COMPLETE reads recent call/chat transcripts and extracts
+   frustration level, intent, competitor mentions → updates FCT_CUSTOMER_360
+        │ (runs after)
+        ▼
+ TASK_CHURN_SCAN  → SP_CHURN_SCAN
+   Flags customers with risk signals (churn score > 0.5, sentiment < -0.3,
+   3+ complaints, renewal soon + falling sentiment, cancel intent, competitor mentions)
+   → inserts PROCESSED.CHURN_ALERTS  (status = NEW, priority, propensity)
+        │ (runs after)
+        ▼
+ TASK_CHURN_NBA  → SP_CHURN_PIPELINE_FULL
+   For each NEW alert:
+     1. SP_CHURN_ROOT_CAUSE        Cortex COMPLETE explains WHY the customer may leave
+     2. SP_GENERATE_RETENTION_NBA  Looks up matching playbooks in RAW.RETENTION_PLAYBOOKS,
+                                   Cortex COMPLETE writes a personalised offer
+   → inserts PROCESSED.NEXT_BEST_ACTIONS  ("NBA" = Next-Best-Action)
+```
+
+**Where you see it:** Landing page → *Customer 360* → *Churn & Retention* (`V_CHURN_DASHBOARD`, `V_NBA_FOR_CRM`). An agent can also click **Generate NBA** in the chat side panel to run `SP_GENERATE_RETENTION_NBA` on demand for one customer.
+
+### 0.8 The Intelligent Chat (two modes)
+
+```
+ User types a message
+        │
+        ▼
+ App gathers context for the selected customer:
+   • FCT_CUSTOMER_360 profile   • CHURN_ALERTS   • NEXT_BEST_ACTIONS
+        │
+        ▼
+ App builds a "system prompt" depending on the mode:
+   Agent Mode    → internal assistant: may show churn score, LTV, strategies, draft outreach
+   Customer Mode → friendly care agent: must NEVER reveal internal scores or IDs
+        │
+        ▼
+ SNOWFLAKE.CORTEX.COMPLETE('llama3.1-8b', prompt)  →  answer shown on screen
+        │
+        ▼
+ Conversation saved to RAW.INTERACTIONS (channel = CHAT)
+        │
+        ▼
+ Next refresh: interaction feeds V_AGG_INTERACTION_SIGNALS → Customer 360 → churn scan
+```
+
+This closes the loop: what customers say in chat influences their sentiment features, which can trigger tomorrow's churn alert and a new retention offer.
+
+### 0.9 Automation cheat-sheet (what runs on its own)
+
+| What | Trigger | Runs | Writes to |
+|------|---------|------|-----------|
+| Claims pipeline (5 agents) | New row in `CLAIMS_LANDING` | `TASK_CLAIMS_ORCHESTRATOR` (checks every 1 min) | `CLAIM_STATE`, `RESOLUTIONS`, `AUDIT_LOG` |
+| Post-decision audit | New row in `RESOLUTIONS` | `TASK_POST_DECISION_ACTIONS` (every 1 min) | `AUDIT_LOG` |
+| Underwriting (3 steps) | New row in `APPLICATIONS` | `TASK_UNDERWRITING_ORCHESTRATOR` (every 1 min) | `UNDERWRITING_DECISIONS`, `AUDIT_LOG` |
+| Customer 360 refresh | Any source table change | Dynamic Table `DT_CUSTOMER_360` (≤ 1 hour lag) | `DT_CUSTOMER_360` |
+| Churn + NBA | Daily 6 AM UTC | 3-task chain | `CHURN_ALERTS`, `NEXT_BEST_ACTIONS` |
+| Fraud pattern vectors | Sundays 2 AM UTC | `TASK_REFRESH_EMBEDDINGS` | `FRAUD_PATTERN_EMBEDDINGS` |
+| Health check | Every 3 hours | `TASK_HEALTH_CHECK` | `CLAIM_STATE`, `CLAIMS_LANDING`, `AUDIT_LOG` |
+| Document extraction | **Manual** | `SP_PROCESS_ALL_PENDING_DOCUMENTS` | `DOCUMENT_REGISTRY` |
+
+> All tasks are created **SUSPENDED**. Nothing runs automatically until each task is resumed (see [Section 13](#13-task-automation-reference)).
+
+### 0.10 How to follow one claim yourself
+
+```sql
+-- 1. The claim as submitted
+SELECT * FROM INSURANCE_DB.RAW.CLAIMS_LANDING WHERE claim_id = 'CLM-001';
+
+-- 2. Each agent's output
+SELECT * FROM INSURANCE_DB.PROCESSED.CLAIM_STATE WHERE claim_id = 'CLM-001';
+
+-- 3. Step-by-step trail (which agent, which AI model, how long)
+SELECT step_number, agent_name, cortex_module_used, model_used, latency_ms, status
+FROM INSURANCE_DB.RESULTS.AUDIT_LOG
+WHERE flow_type = 'CLAIMS' AND reference_id = 'CLM-001'
+ORDER BY step_number;
+
+-- 4. Final decision
+SELECT * FROM INSURANCE_DB.RESULTS.RESOLUTIONS WHERE claim_id = 'CLM-001';
+```
+
+### 0.11 What each SQL object does (plain-English reference)
+
+Every object below lives in `INSURANCE_DB`. The **Called by** column tells you what starts it, so you can trace any step back to the landing page or a task.
+
+#### A. Claims pipeline: orchestrators and the data-quality gate
+
+| Object | What it does, in plain words | Reads | Writes | Called by |
+|--------|------------------------------|-------|--------|-----------|
+| `PROCESSED.SP_PROCESS_ALL_CLAIMS()` | The "dispatcher". Takes up to 20 `SUBMITTED` claims (oldest first), runs the DQ gate on each, then sends passing claims to `SP_PROCESS_CLAIM`. Failing claims are marked `DQ_FAILED`. | `RAW.CLAIMS_LANDING` | `CLAIMS_LANDING.claim_status`, `AUDIT_LOG` (step 0) | `TASK_CLAIMS_ORCHESTRATOR` |
+| `PROCESSED.SP_DQ_VALIDATE_CLAIM(claim_id)` | The "gatekeeper". Errors (block): customer not found, policy not found, policy not `ACTIVE`, policy belongs to someone else, amount missing or ≤ 0. Warnings (allow): LOB mismatch, amount above coverage, similar claim in the last 30 days. Returns `{passed, errors, warnings}`. | `CLAIMS_LANDING`, `CUSTOMERS`, `POLICIES` | — (returns a result only) | `SP_PROCESS_ALL_CLAIMS` |
+| `PROCESSED.SP_PROCESS_CLAIM(claim_id)` | The "assembly line". Calls the 5 agents in order and returns the final decision text. | `RESULTS.RESOLUTIONS` | — (through the agents) | `SP_PROCESS_ALL_CLAIMS`, or run manually |
+
+#### B. Claims pipeline: the 5 agents
+
+Each agent reads the claim, does one job, writes its JSON result to a column of `PROCESSED.CLAIM_STATE`, moves `current_state` forward, and adds one row to `RESULTS.AUDIT_LOG`.
+
+| # | Agent | Its question | How it answers | Saved to | State after | Fallback if AI fails |
+|---|-------|--------------|----------------|----------|-------------|----------------------|
+| 1 | `SP_AGENT_INTAKE` | "How serious is this claim?" | `CORTEX.CLASSIFY_TEXT` labels the description as low / medium / high / critical severity. Creates the `CLAIM_STATE` row and records `started_at`. | `intake_output` | `VALIDATION` | severity = medium |
+| 2 | `SP_AGENT_VALIDATION` | "Is the policy valid?" | Plain SQL: policy must be `ACTIVE` or `RENEWAL_PENDING`. It also notes when the amount is above the coverage limit (a note only, not a rejection). | `validation_output` (`valid`, `issues`) | `FRAUD_CHECK` | `valid = true`, "lookup skipped" |
+| 3 | `SP_AGENT_FRAUD` | "Does it look like fraud?" | Gathers 3 pieces of evidence: (a) `COMPUTE_FRAUD_SIMILARITY`, a vector match against known fraud patterns, (b) Cortex Search on `FRAUD_INDICATORS_SEARCH_SERVICE` filtered by LOB (top 3), (c) `CORTEX.SENTIMENT`. Then `CORTEX.COMPLETE` (llama3.1-8b) turns the evidence into a 0–1 score. Score > 0.7 = HIGH, > 0.4 = MEDIUM, otherwise LOW. | `fraud_output` | `ASSESSMENT` | Formula: 0.4 × vector + 0.3 × negative-sentiment + 0.1 |
+| 4 | `SP_AGENT_ASSESSMENT` | "How much should we pay?" | Cortex Search on `UNDERWRITING_GUIDELINES_SEARCH_SERVICE` (top 2 for this LOB), then `CORTEX.COMPLETE` (llama3.1-8b) suggests a settlement, a confidence, and a damage category (minor / moderate / major / total loss). | `assessment_output` | `RESOLUTION` | 85% of claimed amount, confidence 0.75 |
+| 5 | `SP_AGENT_RESOLUTION` | "Final decision?" | Applies fixed rules: fraud > 0.7 → **REFERRED** (pays 0). Policy invalid → **DENIED** (pays 0). Fraud 0.4–0.7 → **PARTIALLY_APPROVED** (pays 50% of the suggested settlement). Otherwise → **APPROVED**. `CORTEX.COMPLETE` writes a 2–3 sentence explanation. Records total processing time. | `resolution_output`, plus a new row in `RESULTS.RESOLUTIONS` | `COMPLETED` | Settlement = 80% of claimed amount if assessment is missing |
+
+> The AI never makes the final decision alone. The LLM provides scores and explanations, and fixed SQL rules decide the outcome. That makes every decision repeatable and easy to audit.
+
+#### C. Underwriting pipeline
+
+| Object | What it does | Reads | Writes |
+|--------|--------------|-------|--------|
+| `PROCESSED.SP_PROCESS_APPLICATION(app_id)` | Orchestrator. Runs the 3 steps below in order and passes each step's output to the next. | — | — |
+| `PROCESSED.SP_UW_RISK_SCORE(app_id)` | Credit score ≥ 750 → LOW, ≥ 650 → MEDIUM, otherwise HIGH. Looks up `base_rate × risk_multiplier × geographic_factor × history_factor` in the actuarial table (defaults 0.03 / 1.3 / 1.1 / 1.0 if no match). Existing customers get 10% off the history factor. Premium = coverage × score. | `RAW.APPLICATIONS`, `RAW.ACTUARIAL_TABLES` | — (returns JSON) |
+| `PROCESSED.SP_UW_GUIDELINE_LOOKUP(app_id, risk_tier)` | Cortex Search on `UNDERWRITING_GUIDELINES_SEARCH_SERVICE` for "<LOB> <tier> underwriting risk assessment", returning the top 3 guidelines. | `RAW.APPLICATIONS` | — (returns JSON) |
+| `PROCESSED.SP_UW_DECISION(app_id, risk, guidelines)` | LOW → auto-approved (confidence 0.95). MEDIUM → manual review (0.7). HIGH → senior underwriter, premium × 1.5 (0.5). | `RAW.APPLICATIONS` | `RESULTS.UNDERWRITING_DECISIONS`, `APPLICATIONS.status` (`APPROVED` / `REVIEW`), `AUDIT_LOG` |
+
+#### D. Customer 360 (feature building)
+
+| Object | Type | What it calculates per customer |
+|--------|------|---------------------------------|
+| `PROCESSED.V_AGG_POLICY_PORTFOLIO` | View | Active policy count, total annual premium, number of different LOBs, days to the nearest renewal, coverage adequacy, lapse count |
+| `PROCESSED.V_AGG_CLAIMS_HISTORY` | View | Claims in the last 12 months and lifetime, approval ratio, average and maximum claim, total paid, open claims, "claim acceleration" (last 3 months vs last 12) |
+| `PROCESSED.V_AGG_PAYMENT_BEHAVIOR` | View | Average days late, missed payments in 12 months, on-time ratio, days since last payment, auto-pay enrolment |
+| `PROCESSED.V_AGG_INTERACTION_SIGNALS` | View | `CORTEX.SENTIMENT` average over the last 30 days and trend vs the 30 days before, escalations in 90 days, latest NPS, preferred channel |
+| `PROCESSED.V_AGG_EMBEDDING_FEATURES` | View | Highest fraud-similarity score across the customer's claims, a cluster label (1 / 2 / 3), provider anomaly score |
+| `PROCESSED.DT_CUSTOMER_360` | Dynamic Table | Joins `CUSTOMERS` with the first four views and adds derived flags (renewal risk, complaint rate per claim, lifetime loss ratio, high value at risk). Snowflake refreshes it automatically within 1 hour. |
+| `PROCESSED.SP_BUILD_CUSTOMER_360()` | Procedure | Older, manual way to build `FCT_CUSTOMER_360` (MERGE from all 5 views). See Known Issue #1. |
+| `PROCESSED.FCT_CUSTOMER_360_VIEW` | View | A plain `SELECT *` wrapper over `FCT_CUSTOMER_360` |
+
+#### E. Churn and retention
+
+| Object | What it does | Writes |
+|--------|--------------|--------|
+| `PROCESSED.SP_EXTRACT_UNSTRUCTURED_FEATURES_BATCH()` | For every customer with interactions in the last 90 days, sends the transcripts to `CORTEX.COMPLETE` (llama3.3-70b) and extracts: frustration level, intent to cancel, competitor mentions, digital engagement trend, emotional manipulation flag. | `FCT_CUSTOMER_360` (those 5 columns) |
+| `PROCESSED.SP_EXTRACT_INTERACTION_FEATURES(customer_id)` | The same extraction for a single customer. Returns the JSON without saving it. | — |
+| `PROCESSED.SP_CHURN_SCAN()` | Creates a `NEW` alert for customers matching any risk rule: churn score > 0.5, sentiment < -0.3, 3+ complaints, renewal soon with falling sentiment, cancel intent, or 2+ competitor mentions. Labels the main trigger. Priority is set by lifetime value (most valuable = 1). Skips customers who already have an open alert from the last 7 days. | `CHURN_ALERTS` |
+| `PROCESSED.SP_CHURN_ROOT_CAUSE(customer_id)` | Sends the customer profile and the last 90 days of transcripts to `CORTEX.COMPLETE` (llama3.3-70b), which picks one of 7 root causes (price, claims experience, service, coverage gap, competitor, life event, payment difficulty) with a confidence. | `CHURN_ALERTS.root_cause`, status → `IN_PROGRESS` |
+| `PROCESSED.SP_GENERATE_RETENTION_NBA(customer_id)` | Finds up to 3 playbooks in `RAW.RETENTION_PLAYBOOKS` matching the segment or root cause. `CORTEX.COMPLETE` (llama3.3-70b) writes an action (RETAIN / CROSS_SELL / ESCALATE / MONITOR), offer, channel, timing, expected success rate, and talking points. The NBA expires after 14 days. | `NEXT_BEST_ACTIONS` (status `PENDING`), alert → `ACTIONED` |
+| `PROCESSED.SP_CHURN_PIPELINE_FULL()` | Runs the scan, then root cause + NBA for each of today's `NEW` alerts (up to 100, highest priority first). | (through the above) + `AUDIT_LOG` |
+| `PROCESSED.V_CHURN_DASHBOARD` | View: each alert joined with the customer's 360 features and that day's NBA. Shown on the *Churn & Retention* tab. | — |
+| `PROCESSED.V_NBA_FOR_CRM` | **Secure** view: pending, unexpired NBAs with customer name, email, and phone, ready to export to a CRM. "Secure" means the view's SQL logic is hidden from consumers. | — |
+
+#### F. Documents
+
+| Object | What it does |
+|--------|--------------|
+| `RAW.SP_PROCESS_UPLOADED_DOCUMENT(document_id)` | Runs `CORTEX.PARSE_DOCUMENT` (LAYOUT mode) on the staged file to get its text, then `CORTEX.EMBED_TEXT_768` on the first 8,000 characters. Sets `extraction_status` to `EXTRACTED` or `FAILED`. |
+| `RAW.SP_PROCESS_ALL_PENDING_DOCUMENTS()` | Runs the procedure above for up to 50 `PENDING` documents. |
+
+#### G. Helper functions (UDFs)
+
+| Function | Input → Output | How |
+|----------|---------------|-----|
+| `PROCESSED.CLASSIFY_LOB(text)` | claim text → `AUTO` / `PROPERTY` / `WORKERS_COMP` | `CORTEX.COMPLETE` (llama3.3-70b) |
+| `PROCESSED.CLAIM_SENTIMENT(text)` | text → -1 (negative) … +1 (positive) | `CORTEX.SENTIMENT` |
+| `PROCESSED.SUMMARIZE_CLAIM(text)` | long text → short summary | `CORTEX.SUMMARIZE` |
+| `VECTORS.COMPUTE_FRAUD_SIMILARITY(text)` | claim text → 0…1 | Embeds the text (arctic-embed-m) and returns the highest cosine similarity to any row in `FRAUD_PATTERN_EMBEDDINGS` |
+
+#### H. Monitoring
+
+| Object | What it shows or does |
+|--------|----------------------|
+| `PROCESSED.V_PIPELINE_STATUS` | One row per claim in `CLAIM_STATE`: current step, seconds elapsed, fraud score and risk, decision, settlement, customer segment. Used by the *AI Pipeline Monitor* tab. |
+| `PROCESSED.TASK_HEALTH_CHECK` | Every 3 hours: claims stuck for more than 5 minutes → `FAILED` and `MANUAL_REVIEW`. Logs pending, failed, and completed-today counts to `AUDIT_LOG` (`flow_type = SYSTEM`). |
+| `RESULTS.TASK_POST_DECISION_ACTIONS` | For each new resolution, adds an audit row (step 99) recording decision, settlement, and `notification_sent = true`. |
+| `VECTORS.TASK_REFRESH_EMBEDDINGS` | Weekly: embeds any new rows in `RAW.FRAUD_INDICATORS` into `FRAUD_PATTERN_EMBEDDINGS`, so the fraud agent recognises new patterns. |
 
 ---
 
@@ -944,6 +1316,8 @@ Final score is clamped to [0.0, 1.0] and rounded to 2 decimal places.
 1. **SP_BUILD_CUSTOMER_360** — `V_AGG_EMBEDDING_FEATURES` uses a UDF with a correlated subquery that fails inside MERGE. Embedding features (fraud_similarity_score, claim_cluster_id, provider_anomaly_score) are defaulted to 0. Fix: materialize embedding features into a table before joining.
 2. **LOB mismatch** — Seed data policies use LOB types `AUTO`, `HOME`, `LIFE`, but the Property claim form expects `PROPERTY`. Claims submitted for HOME policies via the Property form will fail validation.
 3. **Sentiment defaults to 0** — `V_AGG_INTERACTION_SIGNALS` computes sentiment only for interactions within the last 30 days. Historical seed data interactions are from 2024, so sentiment is 0 for most customers.
+4. **Policy applications don't trigger underwriting** — The IDP Landing page writes to `AUTO_/PROPERTY_/WORKERS_COMP_POLICY_APPLICATIONS`, but `TASK_UNDERWRITING_ORCHESTRATOR` only watches `RAW.APPLICATIONS_STREAM`. Fix: insert into `RAW.APPLICATIONS` as well, or add streams on the LOB tables.
+5. **Document extraction is manual** — No task schedules `SP_PROCESS_ALL_PENDING_DOCUMENTS`; uploaded documents stay `PENDING` until it is called.
 
 ### Resolved in this version
 - **Cortex Search services** — 5 services now created and ACTIVE (previously 0)
