@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>INSURANCE_DB — End-to-End Data Flow</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root { --raw:#e3f2fd; --rawb:#1e88e5; --proc:#e8f5e9; --procb:#43a047; --res:#fff3e0; --resb:#fb8c00;
+          --vec:#f3e5f5; --vecb:#8e24aa; --app:#eceff1; --appb:#546e7a; --ai:#fffde7; --aib:#f9a825; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin:0; color:#222; background:#fafafa; }
+  header { background:#0b3d91; color:#fff; padding:24px 40px; }
+  header h1 { margin:0 0 6px; font-size:26px; }
+  header p { margin:0; opacity:.85; }
+  nav { background:#fff; border-bottom:1px solid #ddd; padding:10px 40px; position:sticky; top:0; z-index:5; }
+  nav a { margin-right:18px; color:#0b3d91; text-decoration:none; font-size:14px; }
+  main { padding:20px 40px 60px; max-width:1400px; }
+  section { background:#fff; border:1px solid #e0e0e0; border-radius:8px; padding:20px 24px; margin:22px 0; }
+  h2 { margin-top:0; color:#0b3d91; border-bottom:2px solid #e3e8f0; padding-bottom:6px; }
+  .mermaid { text-align:center; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:14px; }
+  th, td { border:1px solid #e0e0e0; padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:#f1f4f9; }
+  code { background:#f4f4f4; padding:1px 5px; border-radius:3px; font-size:13px; }
+  .legend span { display:inline-block; padding:4px 10px; margin:4px 6px 4px 0; border-radius:4px; border:2px solid; font-size:13px; }
+  .pill { padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; }
+  .on { background:#c8e6c9; color:#1b5e20; } .off { background:#ffcdd2; color:#b71c1c; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:16px; }
+  .gap { border-left:4px solid #e53935; background:#fff5f5; padding:8px 14px; margin:8px 0; }
+  .note { color:#666; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Insurance Claims Agentic AI Platform — End-to-End Data Flow</h1>
+  <p>Database <code style="color:#000">INSURANCE_DB</code> · Generated 2026-10-19 from live object dependencies, task metadata and PROJECT_DOCUMENTATION.md</p>
+</header>
+<nav>
+  <a href="#overview">Overview</a><a href="#claims">Claims</a><a href="#uw">Underwriting</a><a href="#docs">Documents</a>
+  <a href="#c360">Customer 360 &amp; Churn</a><a href="#fraud">Fraud Vectors</a><a href="#tasks">Automation</a>
+  <a href="#inventory">Inventory</a><a href="#gaps">Known Gaps</a>
+</nav>
+<main>
+
+<section>
+  <h2>Legend</h2>
+  <div class="legend">
+    <span style="background:var(--app);border-color:var(--appb)">App / UI (Streamlit)</span>
+    <span style="background:var(--raw);border-color:var(--rawb)">RAW schema</span>
+    <span style="background:var(--proc);border-color:var(--procb)">PROCESSED schema</span>
+    <span style="background:var(--res);border-color:var(--resb)">RESULTS schema</span>
+    <span style="background:var(--vec);border-color:var(--vecb)">VECTORS schema</span>
+    <span style="background:var(--ai);border-color:var(--aib)">Cortex AI / Task / SP</span>
+  </div>
+  <p class="note">Solid arrows = data writes/reads. Dashed arrows = triggers (stream → task) or task DAG ordering.</p>
+</section>
+
+<section id="overview">
+  <h2>1. End-to-End Overview</h2>
+<pre class="mermaid">
+flowchart LR
+  classDef app fill:#eceff1,stroke:#546e7a
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef proc fill:#e8f5e9,stroke:#43a047
+  classDef res fill:#fff3e0,stroke:#fb8c00
+  classDef vec fill:#f3e5f5,stroke:#8e24aa
+  classDef ai fill:#fffde7,stroke:#f9a825
+
+  UI["IDP Landing Page<br/>(Streamlit)"]:::app
+  subgraph RAW
+    CL[CLAIMS_LANDING]:::raw
+    APPS["APPLICATIONS<br/>+ LOB application tables"]:::raw
+    DOCS["DOCUMENTS_STAGE<br/>+ DOCUMENT_REGISTRY"]:::raw
+    INT[INTERACTIONS]:::raw
+    REF["CUSTOMERS · POLICIES · PAYMENTS<br/>PROVIDERS · FRAUD_INDICATORS<br/>UNDERWRITING_GUIDELINES · ACTUARIAL_TABLES<br/>RETENTION_PLAYBOOKS"]:::raw
+  end
+  CP["Claims Pipeline<br/>5 AI agents"]:::ai
+  UP["Underwriting Pipeline<br/>3 steps"]:::ai
+  DP["Document Pipeline<br/>PARSE + EMBED"]:::ai
+  subgraph VECTORS
+    FPE[FRAUD_PATTERN_EMBEDDINGS]:::vec
+  end
+  subgraph PROCESSED
+    CS[CLAIM_STATE]:::proc
+    C360["DT_CUSTOMER_360 /<br/>FCT_CUSTOMER_360"]:::proc
+    CH["CHURN_ALERTS →<br/>NEXT_BEST_ACTIONS"]:::proc
+  end
+  subgraph RESULTS
+    RESO[RESOLUTIONS]:::res
+    UWD[UNDERWRITING_DECISIONS]:::res
+    AUD[AUDIT_LOG]:::res
+  end
+  CHAT["Intelligent Chat<br/>CORTEX.COMPLETE"]:::ai
+  DASH["Customer 360 Dashboard<br/>Pipeline Monitor · Churn tab"]:::app
+
+  UI --> CL & APPS & DOCS
+  UI --> CHAT --> INT
+  CL -.stream.-> CP
+  REF --> CP
+  FPE --> CP
+  CP --> CS --> RESO
+  CP --> AUD
+  APPS -.stream.-> UP --> UWD
+  UP --> AUD
+  DOCS --> DP
+  REF --> FPE
+  CL & INT & REF --> C360
+  C360 -.daily DAG.-> CH
+  C360 & CH --> CHAT
+  C360 & CH & CS & RESO & AUD --> DASH
+</pre>
+  <p class="note">Feedback loop: chat conversations land in <code>RAW.INTERACTIONS</code> → sentiment features in Customer 360 → can trigger the next day's churn alert and retention offer.</p>
+</section>
+
+<section id="claims">
+  <h2>2. Claims Pipeline (event-driven)</h2>
+<pre class="mermaid">
+flowchart TB
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef proc fill:#e8f5e9,stroke:#43a047
+  classDef res fill:#fff3e0,stroke:#fb8c00
+  classDef vec fill:#f3e5f5,stroke:#8e24aa
+  classDef ai fill:#fffde7,stroke:#f9a825
+  UI[New Claim form<br/>front-end DQ checks] --> CL[RAW.CLAIMS_LANDING<br/>status SUBMITTED]:::raw
+  CL --> STR[RAW.CLAIMS_LANDING_STREAM]:::raw
+  STR -.SYSTEM$STREAM_HAS_DATA, every 1 min.-> T[TASK_CLAIMS_ORCHESTRATOR]:::ai
+  T --> SPA["SP_PROCESS_ALL_CLAIMS<br/>(up to 20 SUBMITTED)"]:::ai
+  SPA --> DQ{SP_DQ_VALIDATE_CLAIM}:::ai
+  DQ -- fail --> DQF[CLAIMS_LANDING.status = DQ_FAILED]:::raw
+  DQ -- pass --> SPC[SP_PROCESS_CLAIM]:::ai
+  SPC --> A1["1 · SP_AGENT_INTAKE<br/>CLASSIFY_TEXT → severity"]:::ai
+  A1 --> A2["2 · SP_AGENT_VALIDATION<br/>SQL policy rules"]:::ai
+  A2 --> A3["3 · SP_AGENT_FRAUD<br/>Vector sim + Cortex Search<br/>+ SENTIMENT + COMPLETE"]:::ai
+  A3 --> A4["4 · SP_AGENT_ASSESSMENT<br/>Cortex Search guidelines<br/>+ COMPLETE → settlement"]:::ai
+  A4 --> A5["5 · SP_AGENT_RESOLUTION<br/>rules → APPROVED / PARTIAL /<br/>DENIED / REFERRED"]:::ai
+  FPE[VECTORS.FRAUD_PATTERN_EMBEDDINGS<br/>via COMPUTE_FRAUD_SIMILARITY]:::vec --> A3
+  FSS[FRAUD_INDICATORS_SEARCH_SERVICE]:::vec --> A3
+  USS[UNDERWRITING_GUIDELINES_SEARCH_SERVICE]:::vec --> A4
+  A1 & A2 & A3 & A4 & A5 --> CS[PROCESSED.CLAIM_STATE]:::proc
+  A1 & A2 & A3 & A4 & A5 --> AUD[RESULTS.AUDIT_LOG]:::res
+  A5 --> RES[RESULTS.RESOLUTIONS]:::res
+  RES --> RSTR[RESULTS.RESOLUTIONS_STREAM]:::res
+  RSTR -.every 1 min.-> PD[TASK_POST_DECISION_ACTIONS]:::ai --> AUD
+  HC[TASK_HEALTH_CHECK<br/>every 180 min]:::ai -- stuck > 5 min → FAILED --> CS
+  HC -- MANUAL_REVIEW --> CL
+  HC --> AUD
+  CS & CL --> VPS[V_PIPELINE_STATUS → AI Pipeline Monitor]:::proc
+</pre>
+</section>
+
+<section id="uw">
+  <h2>3. Underwriting Pipeline</h2>
+<pre class="mermaid">
+flowchart LR
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef res fill:#fff3e0,stroke:#fb8c00
+  classDef ai fill:#fffde7,stroke:#f9a825
+  classDef gap fill:#ffebee,stroke:#e53935,stroke-dasharray:5 5
+  UI[Policy Application form] --> LOB["RAW.AUTO_ / PROPERTY_ /<br/>WORKERS_COMP_POLICY_APPLICATIONS"]:::raw
+  LOB -. no feed exists .-> APP[RAW.APPLICATIONS<br/>status PENDING]:::gap
+  APP --> ST[APPLICATIONS_STREAM]:::raw
+  ST -.every 1 min.-> T[TASK_UNDERWRITING_ORCHESTRATOR]:::ai
+  T --> P[SP_PROCESS_APPLICATION<br/>up to 10]:::ai
+  P --> R["SP_UW_RISK_SCORE<br/>credit → tier, ACTUARIAL_TABLES"]:::ai
+  R --> G["SP_UW_GUIDELINE_LOOKUP<br/>Cortex Search top 3"]:::ai
+  G --> D["SP_UW_DECISION<br/>LOW auto · MED review · HIGH senior ×1.5"]:::ai
+  D --> UWD[RESULTS.UNDERWRITING_DECISIONS]:::res
+  D --> AUD[RESULTS.AUDIT_LOG]:::res
+  D --> APP
+</pre>
+</section>
+
+<section id="docs">
+  <h2>4. Document Pipeline (manual)</h2>
+<pre class="mermaid">
+flowchart LR
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef ai fill:#fffde7,stroke:#f9a825
+  UI[Document Upload / claim attachment] --> STG["@RAW.DOCUMENTS_STAGE/&lt;claim_id&gt;/"]:::raw
+  UI --> REG[RAW.DOCUMENT_REGISTRY<br/>extraction_status PENDING]:::raw
+  M[Manual CALL] --> ALL[RAW.SP_PROCESS_ALL_PENDING_DOCUMENTS<br/>up to 50]:::ai
+  ALL --> ONE[RAW.SP_PROCESS_UPLOADED_DOCUMENT]:::ai
+  STG --> ONE
+  ONE --> PD[CORTEX.PARSE_DOCUMENT LAYOUT]:::ai --> EMB[CORTEX.EMBED_TEXT_768]:::ai
+  EMB --> REG2[DOCUMENT_REGISTRY<br/>EXTRACTED / FAILED]:::raw
+</pre>
+</section>
+
+<section id="c360">
+  <h2>5. Customer 360 &amp; Churn / Retention</h2>
+<pre class="mermaid">
+flowchart LR
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef proc fill:#e8f5e9,stroke:#43a047
+  classDef ai fill:#fffde7,stroke:#f9a825
+  POL[RAW.POLICIES]:::raw --> V1[V_AGG_POLICY_PORTFOLIO]:::proc
+  CL[RAW.CLAIMS_LANDING]:::raw --> V2[V_AGG_CLAIMS_HISTORY]:::proc
+  PAY[RAW.PAYMENTS]:::raw --> V3[V_AGG_PAYMENT_BEHAVIOR]:::proc
+  INT[RAW.INTERACTIONS]:::raw --> V4["V_AGG_INTERACTION_SIGNALS<br/>(CORTEX.SENTIMENT)"]:::proc
+  CUS[RAW.CUSTOMERS]:::raw --> DT
+  V1 & V2 & V3 & V4 --> DT["DT_CUSTOMER_360<br/>Dynamic Table · lag 1 h · AGENT_WH"]:::proc
+  CL & PRV[RAW.PROVIDERS]:::raw --> V5[V_AGG_EMBEDDING_FEATURES]:::proc
+  V1 & V2 & V3 & V4 & V5 --> SPB[SP_BUILD_CUSTOMER_360<br/>legacy MERGE]:::ai --> FCT[FCT_CUSTOMER_360]:::proc
+  FCT --> FV[FCT_CUSTOMER_360_VIEW]:::proc
+
+  T1["TASK_EXTRACT_UNSTRUCTURED_FEATURES<br/>cron 06:00 UTC · COMPLETE llama3.3-70b"]:::ai
+  INT --> T1 --> FCT
+  T1 -.after.-> T2["TASK_CHURN_SCAN<br/>SP_CHURN_SCAN"]:::ai
+  FCT --> T2 --> ALR[CHURN_ALERTS]:::proc
+  T2 -.after.-> T3["TASK_CHURN_NBA<br/>SP_CHURN_PIPELINE_FULL<br/>root cause + NBA"]:::ai
+  PB[RAW.RETENTION_PLAYBOOKS]:::raw --> T3
+  ALR --> T3 --> NBA[NEXT_BEST_ACTIONS]:::proc
+  T3 --> ALR
+  ALR & NBA & FCT --> VCD[V_CHURN_DASHBOARD]:::proc
+  NBA & FCT & CUS --> VCRM["V_NBA_FOR_CRM<br/>(secure view)"]:::proc
+</pre>
+</section>
+
+<section id="fraud">
+  <h2>6. Fraud Pattern Vectors</h2>
+<pre class="mermaid">
+flowchart LR
+  classDef raw fill:#e3f2fd,stroke:#1e88e5
+  classDef proc fill:#e8f5e9,stroke:#43a047
+  classDef vec fill:#f3e5f5,stroke:#8e24aa
+  classDef ai fill:#fffde7,stroke:#f9a825
+  FI[RAW.FRAUD_INDICATORS<br/>10 rows]:::raw --> T["TASK_REFRESH_EMBEDDINGS<br/>cron Sun 02:00 UTC<br/>MERGE · EMBED_TEXT_768 arctic-embed-m"]:::ai
+  T --> FPE[VECTORS.FRAUD_PATTERN_EMBEDDINGS<br/>10 rows · insert-only]:::vec
+  FPE --> F["VECTORS.COMPUTE_FRAUD_SIMILARITY(text)<br/>max cosine similarity"]:::vec
+  F --> A3[SP_AGENT_FRAUD]:::ai
+  F --> V5[PROCESSED.V_AGG_EMBEDDING_FEATURES]:::proc
+</pre>
+  <p class="note">Reference data only — it is not a log of matches. Current rows came from a one-off manual MERGE on 2026-10-03.</p>
+</section>
+
+<section id="tasks">
+  <h2>7. Automation (live task state as of 2026-10-19)</h2>
+  <table>
+    <tr><th>Task</th><th>Trigger / Schedule</th><th>Warehouse</th><th>Runs</th><th>Writes to</th><th>State</th></tr>
+    <tr><td>PROCESSED.TASK_CLAIMS_ORCHESTRATOR</td><td>1 min, when CLAIMS_LANDING_STREAM has data</td><td>AGENT_WH</td><td>SP_PROCESS_ALL_CLAIMS</td><td>CLAIM_STATE, RESOLUTIONS, AUDIT_LOG</td><td><span class="pill off">suspended</span></td></tr>
+    <tr><td>RESULTS.TASK_POST_DECISION_ACTIONS</td><td>1 min, when RESOLUTIONS_STREAM has data</td><td>EVAL_WH</td><td>Inline INSERT</td><td>AUDIT_LOG (step 99)</td><td><span class="pill off">suspended</span></td></tr>
+    <tr><td>PROCESSED.TASK_UNDERWRITING_ORCHESTRATOR</td><td>1 min, when APPLICATIONS_STREAM has data</td><td>AGENT_WH</td><td>SP_PROCESS_APPLICATION loop</td><td>UNDERWRITING_DECISIONS, AUDIT_LOG</td><td><span class="pill off">suspended</span></td></tr>
+    <tr><td>PROCESSED.TASK_EXTRACT_UNSTRUCTURED_FEATURES</td><td>CRON 0 6 * * * UTC (DAG root)</td><td>AGENT_WH</td><td>SP_EXTRACT_UNSTRUCTURED_FEATURES_BATCH</td><td>FCT_CUSTOMER_360</td><td><span class="pill on">started</span></td></tr>
+    <tr><td>PROCESSED.TASK_CHURN_SCAN</td><td>After EXTRACT_UNSTRUCTURED_FEATURES</td><td>EVAL_WH</td><td>SP_CHURN_SCAN</td><td>CHURN_ALERTS</td><td><span class="pill on">started</span></td></tr>
+    <tr><td>PROCESSED.TASK_CHURN_NBA</td><td>After CHURN_SCAN</td><td>AGENT_WH</td><td>SP_CHURN_PIPELINE_FULL</td><td>CHURN_ALERTS, NEXT_BEST_ACTIONS, AUDIT_LOG</td><td><span class="pill on">started</span></td></tr>
+    <tr><td>VECTORS.TASK_REFRESH_EMBEDDINGS</td><td>CRON 0 2 * * 0 UTC</td><td>AGENT_WH</td><td>Inline MERGE</td><td>FRAUD_PATTERN_EMBEDDINGS</td><td><span class="pill off">suspended</span></td></tr>
+    <tr><td>PROCESSED.TASK_HEALTH_CHECK</td><td>180 min</td><td>EVAL_WH</td><td>Inline UPDATE/INSERT</td><td>CLAIM_STATE, CLAIMS_LANDING, AUDIT_LOG</td><td><span class="pill off">suspended</span></td></tr>
+    <tr><td>DT_CUSTOMER_360 (dynamic table)</td><td>Target lag 1 hour</td><td>AGENT_WH</td><td>Auto refresh</td><td>DT_CUSTOMER_360</td><td>—</td></tr>
+    <tr><td>Document extraction</td><td>Manual</td><td>—</td><td>SP_PROCESS_ALL_PENDING_DOCUMENTS</td><td>DOCUMENT_REGISTRY</td><td>—</td></tr>
+  </table>
+</section>
+
+<section id="inventory">
+  <h2>8. Object Inventory (row counts)</h2>
+  <div class="grid">
+    <div><h3>RAW</h3><table>
+      <tr><th>Object</th><th>Rows</th></tr>
+      <tr><td>CUSTOMERS</td><td>8</td></tr><tr><td>POLICIES</td><td>13</td></tr><tr><td>CLAIMS_LANDING</td><td>11</td></tr>
+      <tr><td>PAYMENTS</td><td>15</td></tr><tr><td>INTERACTIONS</td><td>22</td></tr><tr><td>PROVIDERS</td><td>8</td></tr>
+      <tr><td>FRAUD_INDICATORS</td><td>10</td></tr><tr><td>UNDERWRITING_GUIDELINES</td><td>10</td></tr><tr><td>ACTUARIAL_TABLES</td><td>15</td></tr>
+      <tr><td>RETENTION_PLAYBOOKS</td><td>8</td></tr><tr><td>DOCUMENT_REGISTRY</td><td>7</td></tr><tr><td>APPLICATIONS</td><td>1</td></tr>
+      <tr><td>AUTO_/PROPERTY_/WORKERS_COMP_POLICY_APPLICATIONS</td><td>0</td></tr>
+      <tr><td>AUTO_/PROPERTY_/WORKERS_COMP_CLAIMS, DOCUMENTS, CREDIT_BUREAU, GEOGRAPHIC_RISK, POLICE_REPORTS</td><td>0</td></tr>
+      <tr><td>Streams: CLAIMS_LANDING_, APPLICATIONS_, INTERACTIONS_, PAYMENTS_STREAM</td><td>—</td></tr>
+    </table></div>
+    <div><h3>PROCESSED</h3><table>
+      <tr><th>Object</th><th>Rows</th></tr>
+      <tr><td>CLAIM_STATE</td><td>11</td></tr><tr><td>DT_CUSTOMER_360 (dynamic)</td><td>8</td></tr><tr><td>FCT_CUSTOMER_360</td><td>8</td></tr>
+      <tr><td>CHURN_ALERTS</td><td>28</td></tr><tr><td>NEXT_BEST_ACTIONS</td><td>30</td></tr>
+      <tr><td>Views: V_AGG_* (5), V_CHURN_DASHBOARD, V_NBA_FOR_CRM, V_PIPELINE_STATUS, FCT_CUSTOMER_360_VIEW</td><td>—</td></tr>
+      <tr><td>UDFs: CLASSIFY_LOB, CLAIM_SENTIMENT, SUMMARIZE_CLAIM</td><td>—</td></tr>
+    </table></div>
+    <div><h3>RESULTS</h3><table>
+      <tr><th>Object</th><th>Rows</th></tr>
+      <tr><td>AUDIT_LOG</td><td>73</td></tr><tr><td>RESOLUTIONS</td><td>11</td></tr><tr><td>UNDERWRITING_DECISIONS</td><td>1</td></tr>
+      <tr><td>Stream: RESOLUTIONS_STREAM</td><td>—</td></tr>
+    </table>
+    <h3>VECTORS</h3><table>
+      <tr><th>Object</th><th>Rows</th></tr>
+      <tr><td>FRAUD_PATTERN_EMBEDDINGS</td><td>10</td></tr><tr><td>DOCUMENT_CHUNKS</td><td>0</td></tr>
+      <tr><td>UDF: COMPUTE_FRAUD_SIMILARITY</td><td>—</td></tr>
+    </table></div>
+  </div>
+</section>
+
+<section id="gaps">
+  <h2>9. Known Gaps</h2>
+  <div class="gap"><b>Underwriting not wired to UI:</b> nothing moves rows from the three LOB application tables into <code>RAW.APPLICATIONS</code>, so UI submissions never trigger the pipeline.</div>
+  <div class="gap"><b>Document extraction is manual:</b> no task schedules <code>SP_PROCESS_ALL_PENDING_DOCUMENTS</code>; <code>VECTORS.DOCUMENT_CHUNKS</code> is empty.</div>
+  <div class="gap"><b>Two Customer 360 tables:</b> <code>DT_CUSTOMER_360</code> auto-refreshes, but the app, churn scan and chat read <code>FCT_CUSTOMER_360</code>, which only changes via the legacy <code>SP_BUILD_CUSTOMER_360</code> and the unstructured-feature task.</div>
+  <div class="gap"><b>Embeddings are insert-only:</b> the MERGE has no <code>WHEN MATCHED</code> clause, so edited fraud indicators are not re-embedded, and the refresh task is suspended.</div>
+  <div class="gap"><b>Event-driven tasks suspended:</b> claims, post-decision, underwriting, health-check and embedding tasks are all suspended; only the daily churn DAG is started.</div>
+  <div class="gap"><b>Unused streams:</b> <code>INTERACTIONS_STREAM</code> and <code>PAYMENTS_STREAM</code> have no consuming task.</div>
+</section>
+
+</main>
+<script>mermaid.initialize({ startOnLoad:true, theme:'default', flowchart:{ useMaxWidth:true, htmlLabels:true } });</script>
+</body>
+</html>
